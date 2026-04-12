@@ -46,7 +46,7 @@ async fn main() {
 async fn start_portal() -> anyhow::Result<Connection> {
     let connection = Builder::session()?
         .name(PORTAL_DBUS_NAME)?
-        .serve_at(PORTAL_DBUS_PATH, ScreenCastPortal)?
+        .serve_at(PORTAL_DBUS_PATH, ScreenCastPortal::default())?
         .build()
         .await?;
 
