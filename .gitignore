@@ -1,15 +1,8 @@
 # devenv
-.devenv*
-devenv.local.nix
-devenv.local.yaml
+.direnv/
 
-# direnv
-.direnv
+# rust
+target/
 
-# pre-commit
-.pre-commit-config.yaml
-
-
-# Added by cargo
-
-/target
+# nix
+result

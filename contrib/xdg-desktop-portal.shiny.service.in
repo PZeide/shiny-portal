@@ -1,0 +1,12 @@
+[Unit]
+Description=Portal service (for shiny-shell)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.shiny
+ExecStart=@xdg_install_dir@/xdg-desktop-portal-shiny
+Restart=on-failure
+Slice=session.slice
