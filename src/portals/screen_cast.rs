@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use enumflags2::{BitFlags, bitflags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr as DeserializeRepr, Serialize_repr as SerializeRepr};
 use tracing::{debug, error, info, warn};
 use zbus::{Connection, interface};
@@ -17,7 +17,7 @@ use crate::{
     portals::{PortalResponse, request::Request, session::Session},
 };
 
-#[bitflags]
+#[bitflags(default = Monitor | Window)]
 #[derive(PartialEq, Eq, Copy, Clone, SerializeRepr, DeserializeRepr, Debug, Type)]
 #[repr(u32)]
 enum SourceType {
@@ -26,7 +26,7 @@ enum SourceType {
     Virtual = 4,
 }
 
-#[bitflags]
+#[bitflags(default = Hidden)]
 #[derive(PartialEq, Eq, Copy, Clone, SerializeRepr, DeserializeRepr, Debug, Type)]
 #[repr(u32)]
 enum CursorMode {
@@ -35,9 +35,10 @@ enum CursorMode {
     Metadata = 4,
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, SerializeRepr, DeserializeRepr, Debug, Type)]
+#[derive(Default, PartialEq, Eq, Copy, Clone, SerializeRepr, DeserializeRepr, Debug, Type)]
 #[repr(u32)]
 pub enum PersistMode {
+    #[default]
     DoNot = 0,
     Application = 1,
     Explicit = 2,
@@ -49,7 +50,7 @@ struct CreateSessionResult {
     session_id: String,
 }
 
-#[derive(SerializeDict, DeserializeDict, Debug, Type)]
+#[derive(Serialize, Deserialize, Debug, Type)]
 #[zvariant(signature = "(suv)")]
 struct RestoreData {
     vendor: String,
@@ -88,16 +89,27 @@ struct StartResult {
 }
 
 #[derive(Debug)]
-struct ScreenCastRequest {
-    session_handle: OwnedObjectPath,
+struct ScreenCastOptions {
     source_types: BitFlags<SourceType>,
     cursor_mode: CursorMode,
     persist_mode: PersistMode,
     restore_data: Option<RestoreData>,
 }
 
+impl Default for ScreenCastOptions {
+    fn default() -> Self {
+        Self {
+            source_types: SourceType::Monitor | SourceType::Window,
+            cursor_mode: CursorMode::Hidden,
+            persist_mode: PersistMode::DoNot,
+            restore_data: None,
+        }
+    }
+}
+
 struct ScreenCastSession {
     session_handle: OwnedObjectPath,
+    options: ScreenCastOptions,
     cast_thread: Option<ScreencastThread>,
 }
 
@@ -110,7 +122,7 @@ pub struct ScreenCastPortal {
 impl ScreenCastPortal {
     #[zbus(property)]
     async fn available_source_types(&self) -> u32 {
-        (SourceType::Monitor | SourceType::Window | SourceType::Virtual).bits()
+        (SourceType::Monitor | SourceType::Window).bits()
     }
 
     #[zbus(property)]
@@ -131,25 +143,10 @@ impl ScreenCastPortal {
         app_id: String,
         _options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse<CreateSessionResult>> {
-        info!("creating screenshare session for app {app_id} (session: {session_handle})");
+        info!("creating screencast session for app {app_id} at {session_handle}");
 
-        Request::register(
-            connection.object_server(),
-            &request_handle,
-            ScreenCastRequest {
-                session_handle: session_handle.to_owned().into(),
-                source_types: BitFlags::from(SourceType::Monitor),
-                cursor_mode: CursorMode::Hidden,
-                restore_data: None,
-                persist_mode: PersistMode::DoNot,
-            },
-            |inner| {
-                let session_handle = inner.session_handle.clone();
-                async move {
-                    debug!("removing request of session {session_handle:?}");
-                }
-            },
-        )
+        Request::register(connection.object_server(), &request_handle, (), |_| async {
+        })
         .await?;
 
         Session::register(
@@ -157,6 +154,7 @@ impl ScreenCastPortal {
             &session_handle,
             ScreenCastSession {
                 session_handle: session_handle.to_owned().into(),
+                options: ScreenCastOptions::default(),
                 cast_thread: None,
             },
             |inner| {
@@ -164,10 +162,9 @@ impl ScreenCastPortal {
                 let thread = inner.cast_thread.take();
 
                 async move {
-                    debug!("removing session {session_handle:?}");
-
+                    debug!("removing screencast session {session_handle:?}");
                     if let Some(thread) = thread {
-                        debug!("screencast session found, stopping thread");
+                        debug!("stopping active PipeWire stream for {session_handle:?}");
                         thread.stop();
                     }
                 }
@@ -175,7 +172,6 @@ impl ScreenCastPortal {
         )
         .await?;
 
-        debug!("session created for {app_id} at {session_handle:?} (request: {request_handle:?})");
         Ok(PortalResponse::Success(CreateSessionResult {
             session_id: session_handle.to_string(),
         }))
@@ -189,44 +185,49 @@ impl ScreenCastPortal {
         app_id: String,
         options: SelectSourcesOptions,
     ) -> zbus::fdo::Result<PortalResponse> {
-        info!("configuring sources for app {app_id} (session: {session_handle})");
+        info!("selecting screencast sources for app {app_id} in {session_handle}");
+        Request::register(connection.object_server(), &request_handle, (), |_| async {
+        })
+        .await?;
 
-        let Some(request_interface) =
-            Request::<ScreenCastRequest>::get(connection.object_server(), &request_handle).await
+        let Some(session_interface) =
+            Session::<ScreenCastSession>::get(connection.object_server(), &session_handle).await
         else {
-            info!("request with handle {request_handle:?} not found");
+            warn!("session {session_handle:?} not found");
             return Ok(PortalResponse::Other);
         };
 
-        let request = &mut request_interface.get_mut().await.inner;
+        let mut session = session_interface.get_mut().await;
 
         if let Some(types) = options.types {
-            request.source_types = types;
+            session.inner.options.source_types = types;
         }
 
-        if let Some(_) = options.multiple {
-            warn!("option 'multiple' is unsupported for request {request_handle:?}");
+        if options.multiple == Some(true) {
+            warn!("multiple source selection is not supported; only one source will be returned");
         }
 
         if let Some(mode) = options.cursor_mode {
             if mode == CursorMode::Metadata {
-                warn!(
-                    "option 'cursor_mode' with value 'Metadata' is unsupported for request {request_handle:?}"
-                );
+                warn!("metadata cursor mode is unsupported; keeping previous cursor mode");
             } else {
-                request.cursor_mode = mode;
+                session.inner.options.cursor_mode = mode;
             }
         }
 
         if let Some(restore_data) = options.restore_data {
-            request.restore_data = Some(restore_data);
+            session.inner.options.restore_data = Some(restore_data);
         }
 
         if let Some(mode) = options.persist_mode {
-            request.persist_mode = mode;
+            session.inner.options.persist_mode = mode;
         }
 
-        debug!("request {request_handle:?} updated {request:?}");
+        debug!(
+            "session {session_handle:?} options updated: {:?}",
+            session.inner.options
+        );
+
         Ok(PortalResponse::Success(HashMap::new()))
     }
 
@@ -239,30 +240,27 @@ impl ScreenCastPortal {
         parent_window: String,
         _options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse<StartResult>> {
-        info!("starting screen cast for app {app_id} (session: {session_handle})");
-
-        let Some(request_interface) =
-            Request::<ScreenCastRequest>::get(connection.object_server(), &request_handle).await
-        else {
-            info!("request with handle {request_handle:?} not found");
-            return Ok(PortalResponse::Other);
-        };
+        info!("starting screencast for app {app_id} in {session_handle}");
+        Request::register(connection.object_server(), &request_handle, (), |_| async {
+        })
+        .await?;
 
         let Some(session_interface) =
             Session::<ScreenCastSession>::get(connection.object_server(), &session_handle).await
         else {
-            info!("session with handle {session_handle:?} not found");
+            warn!("session {session_handle:?} not found");
             return Ok(PortalResponse::Other);
         };
 
-        let mut request = request_interface.get_mut().await;
+        let mut session = session_interface.get_mut().await;
+        let options = &session.inner.options;
 
         let share_result = match self
             .shell
             .share_picker(SharePickerOptions {
-                allow_monitor: Some(request.inner.source_types.contains(SourceType::Monitor)),
-                allow_window: Some(request.inner.source_types.contains(SourceType::Window)),
-                allow_custom_region: Some(request.inner.source_types.contains(SourceType::Virtual)),
+                allow_monitor: Some(options.source_types.contains(SourceType::Monitor)),
+                allow_window: Some(options.source_types.contains(SourceType::Window)),
+                allow_custom_region: Some(false),
                 allow_restore_token_default: None,
                 dialog_parent_window_handle: Some(parent_window),
             })
@@ -270,7 +268,7 @@ impl ScreenCastPortal {
         {
             Ok(result) => result,
             Err(err) => {
-                warn!("share picker failed: {err:?}");
+                warn!("share picker failed: {err}");
                 return Ok(PortalResponse::Other);
             }
         };
@@ -279,69 +277,74 @@ impl ScreenCastPortal {
             result: selection, ..
         } = share_result
         else {
-            info!("share picker cancelled");
+            info!("share picker was cancelled");
             return Ok(PortalResponse::Cancelled);
         };
 
-        let overlay_cursor = request.inner.cursor_mode == CursorMode::Embedded;
+        let overlay_cursor = options.cursor_mode == CursorMode::Embedded;
 
-        request.close(connection.object_server()).await?;
-        drop(request);
-
-        let mut session = session_interface.get_mut().await;
-
-        let Ok(connection) = libwayshot::WayshotConnection::new() else {
+        let Ok(wayshot) = libwayshot::WayshotConnection::new() else {
             error!("failed to create libwayshot connection");
             return Ok(PortalResponse::Other);
         };
 
-        let target = match selection {
+        let (target, source_type) = match selection {
             SelectionResult::Monitor { monitor, .. } => {
-                let Some(output) = connection
+                let Some(output) = wayshot
                     .get_all_outputs()
                     .into_iter()
                     .find(|o| o.name == monitor)
                 else {
-                    warn!("cannot find selected monitor {monitor}");
+                    warn!("selected monitor {monitor} was not found");
                     return Ok(PortalResponse::Other);
                 };
 
-                CastTarget::Screen(output.wl_output.clone())
+                info!("selected monitor source: {monitor}");
+                (
+                    CastTarget::Screen(output.wl_output.clone()),
+                    SourceType::Monitor,
+                )
             }
             SelectionResult::Window { stable_id, .. } => {
-                let Some(window) = connection
+                let Some(window) = wayshot
                     .get_all_toplevels()
                     .into_iter()
                     .find(|w| w.identifier == stable_id)
                 else {
-                    warn!("cannot find selected window {stable_id}");
+                    warn!("selected window {stable_id} was not found");
                     return Ok(PortalResponse::Other);
                 };
 
-                CastTarget::TopLevel(window.handle.clone())
+                info!("selected window source: {stable_id}");
+                (
+                    CastTarget::TopLevel(window.handle.clone()),
+                    SourceType::Window,
+                )
             }
-            SelectionResult::Custom { .. } => {
-                // FIXME Later
+            SelectionResult::Custom { region, .. } => {
+                warn!("custom region capture is not implemented yet: {region:?}");
                 return Ok(PortalResponse::Other);
             }
         };
 
-        let cast_thread = ScreencastThread::start_cast(overlay_cursor, None, target, connection)
+        let cast_thread = ScreencastThread::start_cast(overlay_cursor, None, target, wayshot)
             .await
-            .map_err(|e| {
-                zbus::Error::Failure(format!("cannot start pipewire stream, error: {e}"))
-            })?;
+            .map_err(|err| zbus::Error::Failure(format!("cannot start PipeWire stream: {err}")))?;
 
         let node_id = cast_thread.node_id();
-        session.inner.cast_thread = Some(cast_thread);
+        if let Some(previous) = session.inner.cast_thread.replace(cast_thread) {
+            previous.stop();
+        }
+
+        info!("screencast started with PipeWire node id {node_id}");
 
         Ok(PortalResponse::Success(StartResult {
             streams: vec![Stream(
                 node_id,
                 StreamProperties {
                     position: None,
-                    size: (1920, 1080),
-                    source_type: SourceType::Monitor,
+                    size: (0, 0),
+                    source_type,
                     mapping_id: None,
                 },
             )],

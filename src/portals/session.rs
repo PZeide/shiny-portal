@@ -22,13 +22,13 @@ impl<T: Send + Sync + 'static> Session<T> {
         let session = Session {
             handle_path: handle_path.to_owned().into(),
             inner,
-            cleanup_fn: Some(Box::new(move |d| cleanup_fn(d).boxed())),
+            cleanup_fn: Some(Box::new(move |data| cleanup_fn(data).boxed())),
         };
 
         if server.at(handle_path, session).await? {
             Ok(())
         } else {
-            Err(zbus::Error::Failure("interface already exists".into()))
+            Err(zbus::Error::Failure("session already exists".into()))
         }
     }
 

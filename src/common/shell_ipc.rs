@@ -13,8 +13,8 @@ pub static SHINY_SHELL_COMMAND: &str = "shiny-shell";
 pub enum ShellError {
     #[error("process error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("quickshell error: {0}")]
-    Quickshell(String),
+    #[error("shiny-shell error: {0}")]
+    ShinyShell(String),
     #[error("ipc error: {0}")]
     Ipc(String),
     #[error("json error: {0}")]
@@ -24,9 +24,14 @@ pub enum ShellError {
 #[derive(Deserialize, Debug)]
 #[serde(tag = "status", rename_all = "camelCase")]
 enum ShellCallResult<T> {
+    #[serde(rename_all = "camelCase")]
     Ok { data: T },
+    #[serde(rename_all = "camelCase")]
     Error { message: String },
 }
+
+#[derive(Clone, Default)]
+pub struct ShinyShell;
 
 impl ShinyShell {
     async fn call<T>(
@@ -49,21 +54,27 @@ impl ShinyShell {
             .output()
             .await?;
 
-        if !output.stderr.is_empty() {
+        if !output.status.success() || !output.stderr.is_empty() {
             let error = String::from_utf8_lossy(&output.stderr)
                 .lines()
                 .find(|line| !line.trim().is_empty())
-                .unwrap_or("unknown")
+                .unwrap_or("process failed or returned non-zero exit code")
                 .to_string();
 
-            return Err(ShellError::Quickshell(error));
+            return Err(ShellError::ShinyShell(error));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let result = serde_json::from_str(&stdout)?;
-        match result {
-            ShellCallResult::Ok { data } => Ok(data),
-            ShellCallResult::Error { message } => Err(ShellError::Ipc(message)),
+        let stdout = stdout.trim();
+
+        match serde_json::from_str::<ShellCallResult<serde_json::Value>>(stdout) {
+            Ok(ShellCallResult::Ok { data }) => Ok(serde_json::from_value::<T>(data)?),
+            Ok(ShellCallResult::Error { message }) => Err(ShellError::Ipc(message)),
+            Err(err) => Err(ShellError::ShinyShell(if stdout.is_empty() {
+                err.to_string()
+            } else {
+                stdout.to_string()
+            })),
         }
     }
 
@@ -71,7 +82,7 @@ impl ShinyShell {
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
-        debug!("listening for signal: {target}::{signal}");
+        debug!("listening for shell signal: {target}::{signal}");
 
         let mut child = Command::new(SHINY_SHELL_COMMAND)
             .arg("ipc")
@@ -95,24 +106,25 @@ impl ShinyShell {
                     line_result = reader.next_line() => {
                         match line_result {
                             Ok(Some(line)) => {
-                                let trimmed = line.trim();
-                                if trimmed.is_empty() { continue; }
+                                let line = line.trim();
+                                if line.is_empty() {
+                                    continue;
+                                }
 
-                                match serde_json::from_str::<T>(trimmed) {
+                                match serde_json::from_str::<T>(line) {
                                     Ok(data) => {
                                         let _ = tx.send(data).await;
-                                    },
-                                    Err(err) => warn!("error deserializing signal: {err}")
+                                    }
+                                    Err(err) => warn!("error deserializing shell signal: {err}"),
                                 }
                             }
                             Ok(None) => break,
                             Err(err) => {
-                                warn!("error reading from process: {err}");
+                                warn!("error reading shell signal: {err}");
                                 break;
                             }
                         }
                     }
-
                     _ = tx.closed() => {
                         let _ = child.kill().await;
                         break;
@@ -122,6 +134,36 @@ impl ShinyShell {
         });
 
         Ok(rx)
+    }
+
+    pub async fn share_picker(
+        &self,
+        options: SharePickerOptions,
+    ) -> Result<SharePickerResult, ShellError> {
+        let json = serde_json::to_string(&options)?;
+        let request_id = self
+            .call::<SharePickerRequestResult>("share-picker", "request", &[&json])
+            .await?
+            .0;
+
+        let mut rx = self
+            .listen::<SharePickerResult>("share-picker", "result")
+            .await?;
+
+        while let Some(result) = rx.recv().await {
+            match &result {
+                SharePickerResult::Selected { key, .. } | SharePickerResult::Cancelled { key }
+                    if key == &request_id =>
+                {
+                    return Ok(result);
+                }
+                _ => {}
+            }
+        }
+
+        Err(ShellError::Ipc(
+            "stream closed without picker result".into(),
+        ))
     }
 }
 
@@ -142,16 +184,20 @@ pub enum SharePickerResult {
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[allow(dead_code)]
 pub enum SelectionResult {
+    #[serde(rename_all = "camelCase")]
     Monitor {
         allow_restore_token: bool,
         monitor: String,
     },
+    #[serde(rename_all = "camelCase")]
     Window {
         allow_restore_token: bool,
         window_address: String,
         stable_id: String,
     },
+    #[serde(rename_all = "camelCase")]
     Custom {
         allow_restore_token: bool,
         region: CustomRegion,
@@ -160,6 +206,7 @@ pub enum SelectionResult {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct CustomRegion {
     pub monitor: String,
     pub x: i32,
@@ -176,40 +223,4 @@ pub struct SharePickerOptions {
     pub allow_custom_region: Option<bool>,
     pub allow_restore_token_default: Option<bool>,
     pub dialog_parent_window_handle: Option<String>,
-}
-
-#[derive(Default)]
-pub struct ShinyShell;
-
-impl ShinyShell {
-    pub async fn share_picker(
-        &self,
-        options: SharePickerOptions,
-    ) -> Result<SharePickerResult, ShellError> {
-        let json = serde_json::to_string(&options)?;
-        let request_id = self
-            .call::<SharePickerRequestResult>("share_picker", "request", &[&json])
-            .await?
-            .0;
-
-        let mut tx = self
-            .listen::<SharePickerResult>("share-picker", "result")
-            .await?;
-
-        while let Some(result) = tx.recv().await {
-            if let SharePickerResult::Selected { ref key, .. } = result {
-                if key == &request_id {
-                    return Ok(result);
-                }
-            }
-
-            if let SharePickerResult::Cancelled { ref key } = result {
-                if key == &request_id {
-                    return Ok(result);
-                }
-            }
-        }
-
-        Err(ShellError::Ipc("Stream closed without result".into()))
-    }
 }

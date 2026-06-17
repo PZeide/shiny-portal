@@ -1,4 +1,4 @@
 [D-BUS Service]
 Name=org.freedesktop.impl.portal.desktop.shiny
-Exec=@xdg_install_dir@/xdg-desktop-portal-shiny
+Exec=@libexecdir@/xdg-desktop-portal-shiny
 SystemdService=xdg-desktop-portal-shiny.service

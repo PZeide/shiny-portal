@@ -28,10 +28,11 @@ impl<T: Send + Sync + 'static> Request<T> {
         if server.at(handle_path, request).await? {
             Ok(())
         } else {
-            Err(zbus::Error::Failure("interface already exists".into()))
+            Err(zbus::Error::Failure("request already exists".into()))
         }
     }
 
+    #[allow(dead_code)]
     pub async fn get(
         server: &ObjectServer,
         handle_path: &ObjectPath<'_>,

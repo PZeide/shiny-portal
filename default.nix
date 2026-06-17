@@ -1,35 +1,26 @@
 {
   lib,
-  stdenv,
   rustPlatform,
-  cargo,
-  rustc,
-  meson,
-  ninja,
   pkg-config,
   xdg-desktop-portal,
   libgbm,
   libGL,
   wayland,
   pipewire,
+  libxkbcommon,
   ...
 }:
-stdenv.mkDerivation {
+rustPlatform.buildRustPackage {
   pname = "xdg-desktop-portal-shiny";
   version = (fromTOML (builtins.readFile ./Cargo.toml)).package.version;
   src = ./.;
 
   nativeBuildInputs = [
     pkg-config
-    meson
-    ninja
-    rustc
-    cargo
-    rustPlatform.cargoSetupHook
     rustPlatform.bindgenHook
   ];
 
-  cargoDeps = rustPlatform.importCargoLock {
+  cargoLock = {
     lockFile = ./Cargo.lock;
   };
 
@@ -39,13 +30,25 @@ stdenv.mkDerivation {
     libGL
     wayland
     pipewire
+    libxkbcommon
   ];
 
+  postPatch = ''
+    substituteInPlace contrib/org.freedesktop.impl.portal.desktop.shiny.service.in \
+      --replace-fail @libexecdir@ "$out/libexec"
+    substituteInPlace contrib/xdg-desktop-portal.shiny.service.in \
+      --replace-fail @libexecdir@ "$out/libexec"
+  '';
+
   postInstall = ''
-    patchelf \
-      --add-needed libwayland-client.so.0 \
-      --add-rpath ${lib.makeLibraryPath [wayland]} \
+    install -Dm755 $out/bin/xdg-desktop-portal-shiny \
       $out/libexec/xdg-desktop-portal-shiny
+    install -Dm644 contrib/shiny.portal \
+      $out/share/xdg-desktop-portal/portals/shiny.portal
+    install -Dm644 contrib/org.freedesktop.impl.portal.desktop.shiny.service.in \
+      $out/share/dbus-1/services/org.freedesktop.impl.portal.desktop.shiny.service
+    install -Dm644 contrib/xdg-desktop-portal.shiny.service.in \
+      $out/lib/systemd/user/xdg-desktop-portal-shiny.service
   '';
 
   meta = {

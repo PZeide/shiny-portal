@@ -1,6 +1,6 @@
 use clap::Parser;
 use tracing::{error, info};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{EnvFilter, fmt};
 use zbus::{Connection, conn::Builder};
 
 use crate::{
@@ -15,15 +15,11 @@ mod portals;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let cli = Cli::parse();
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(if cli.verbose {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::INFO
-        })
-        .finish();
+    let default_filter = if cli.verbose { "debug" } else { "info" };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
-    tracing::subscriber::set_global_default(subscriber).expect("failed to init logger");
+    fmt().with_env_filter(filter).init();
 
     let portal_connection = match start_portal().await {
         Ok(conn) => conn,
@@ -44,11 +40,9 @@ async fn main() {
 }
 
 async fn start_portal() -> anyhow::Result<Connection> {
-    let connection = Builder::session()?
+    Ok(Builder::session()?
         .name(PORTAL_DBUS_NAME)?
         .serve_at(PORTAL_DBUS_PATH, ScreenCastPortal::default())?
         .build()
-        .await?;
-
-    Ok(connection)
+        .await?)
 }

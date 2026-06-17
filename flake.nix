@@ -15,14 +15,6 @@
       pkgs = nixpkgs.legacyPackages.${system};
       xdg-desktop-portal-shiny = pkgs.callPackage ./default.nix {};
     in {
-      devShells.default = pkgs.mkShell {
-        inputsFrom = [xdg-desktop-portal-shiny];
-
-        packages = with pkgs; [
-          llvmPackages.clang
-        ];
-      };
-
       packages = rec {
         inherit xdg-desktop-portal-shiny;
         default = xdg-desktop-portal-shiny;

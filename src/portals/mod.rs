@@ -3,10 +3,9 @@ use std::collections::HashMap;
 use serde::{Serialize, Serializer};
 use zvariant::{OwnedValue, Type, Value};
 
-mod request;
-mod session;
-
+pub mod request;
 pub mod screen_cast;
+pub mod session;
 
 pub static PORTAL_DBUS_NAME: &str = "org.freedesktop.impl.portal.desktop.shiny";
 pub static PORTAL_DBUS_PATH: &str = "/org/freedesktop/portal/desktop";
