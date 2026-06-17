@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use enumflags2::{BitFlags, bitflags};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr as DeserializeRepr, Serialize_repr as SerializeRepr};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use zbus::{Connection, interface};
 use zvariant::{
     DeserializeDict, ObjectPath, OwnedObjectPath, OwnedValue, SerializeDict, Type, Value,
@@ -11,8 +11,9 @@ use zvariant::{
 
 use crate::{
     common::{
-        pipewire_cast::{CastTarget, ScreencastThread},
+        pipewire_cast::ScreencastThread,
         shell_ipc::{SelectionResult, SharePickerOptions, SharePickerResult, ShinyShell},
+        wayland_capture::{CaptureTarget, DirectCapture},
     },
     portals::{PortalResponse, request::Request, session::Session},
 };
@@ -283,16 +284,16 @@ impl ScreenCastPortal {
 
         let overlay_cursor = options.cursor_mode == CursorMode::Embedded;
 
-        let Ok(wayshot) = libwayshot::WayshotConnection::new() else {
-            error!("failed to create libwayshot connection");
+        let Ok(capture) = DirectCapture::connect() else {
+            warn!("failed to create direct Wayland capture connection");
             return Ok(PortalResponse::Other);
         };
 
         let (target, source_type) = match selection {
             SelectionResult::Monitor { monitor, .. } => {
-                let Some(output) = wayshot
-                    .get_all_outputs()
-                    .into_iter()
+                let Some(output) = capture
+                    .outputs()
+                    .iter()
                     .find(|o| o.name == monitor)
                 else {
                     warn!("selected monitor {monitor} was not found");
@@ -301,14 +302,14 @@ impl ScreenCastPortal {
 
                 info!("selected monitor source: {monitor}");
                 (
-                    CastTarget::Screen(output.wl_output.clone()),
+                    CaptureTarget::Output(output.output.clone()),
                     SourceType::Monitor,
                 )
             }
             SelectionResult::Window { stable_id, .. } => {
-                let Some(window) = wayshot
-                    .get_all_toplevels()
-                    .into_iter()
+                let Some(window) = capture
+                    .toplevels()
+                    .iter()
                     .find(|w| w.identifier == stable_id)
                 else {
                     warn!("selected window {stable_id} was not found");
@@ -317,21 +318,22 @@ impl ScreenCastPortal {
 
                 info!("selected window source: {stable_id}");
                 (
-                    CastTarget::TopLevel(window.handle.clone()),
+                    CaptureTarget::Toplevel(window.handle.clone()),
                     SourceType::Window,
                 )
             }
             SelectionResult::Custom { region, .. } => {
-                warn!("custom region capture is not implemented yet: {region:?}");
+                warn!("custom region capture is not implemented: {region:?}");
                 return Ok(PortalResponse::Other);
             }
         };
 
-        let cast_thread = ScreencastThread::start_cast(overlay_cursor, None, target, wayshot)
+        let cast_thread = ScreencastThread::start_cast(overlay_cursor, target, capture)
             .await
             .map_err(|err| zbus::Error::Failure(format!("cannot start PipeWire stream: {err}")))?;
 
         let node_id = cast_thread.node_id();
+        let size = cast_thread.size();
         if let Some(previous) = session.inner.cast_thread.replace(cast_thread) {
             previous.stop();
         }
@@ -343,7 +345,7 @@ impl ScreenCastPortal {
                 node_id,
                 StreamProperties {
                     position: None,
-                    size: (0, 0),
+                    size: (size.width as i32, size.height as i32),
                     source_type,
                     mapping_id: None,
                 },
