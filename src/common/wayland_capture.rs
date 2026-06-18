@@ -119,6 +119,150 @@ pub struct CaptureProbe {
     pub has_dmabuf_device: bool,
 }
 
+const MAX_DAMAGE_RECTS: usize = 24;
+const FULL_DAMAGE_AREA_PERCENT: u64 = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl DamageRect {
+    fn full(size: Size) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: size.width.min(i32::MAX as u32) as i32,
+            height: size.height.min(i32::MAX as u32) as i32,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    fn clipped_to(&self, size: Size) -> Option<Self> {
+        if !self.is_valid() || size.width == 0 || size.height == 0 {
+            return None;
+        }
+
+        let max_x = size.width.min(i32::MAX as u32) as i64;
+        let max_y = size.height.min(i32::MAX as u32) as i64;
+        let x1 = (self.x as i64).clamp(0, max_x);
+        let y1 = (self.y as i64).clamp(0, max_y);
+        let x2 = (self.x as i64 + self.width as i64).clamp(0, max_x);
+        let y2 = (self.y as i64 + self.height as i64).clamp(0, max_y);
+
+        if x2 <= x1 || y2 <= y1 {
+            return None;
+        }
+
+        Some(Self {
+            x: x1 as i32,
+            y: y1 as i32,
+            width: (x2 - x1) as i32,
+            height: (y2 - y1) as i32,
+        })
+    }
+
+    fn area(&self) -> u64 {
+        if !self.is_valid() {
+            return 0;
+        }
+
+        self.width as u64 * self.height as u64
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamageSet {
+    full: bool,
+    rects: Vec<DamageRect>,
+}
+
+impl DamageSet {
+    pub fn full() -> Self {
+        Self {
+            full: true,
+            rects: Vec::new(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            full: false,
+            rects: Vec::new(),
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
+    pub fn add_many(&mut self, rects: &[DamageRect], frame_size: Size) {
+        if self.full {
+            return;
+        }
+
+        for rect in rects {
+            if let Some(rect) = rect.clipped_to(frame_size) {
+                self.rects.push(rect);
+            }
+        }
+        self.simplify(frame_size);
+    }
+
+    pub fn rects_for_frame(&self, frame_size: Size) -> Vec<DamageRect> {
+        if self.full {
+            return vec![DamageRect::full(frame_size)];
+        }
+
+        self.rects
+            .iter()
+            .filter_map(|rect| rect.clipped_to(frame_size))
+            .collect()
+    }
+
+    fn simplify(&mut self, frame_size: Size) {
+        if self.full {
+            return;
+        }
+
+        self.rects = self
+            .rects
+            .iter()
+            .filter_map(|rect| rect.clipped_to(frame_size))
+            .collect();
+
+        if self.rects.len() > MAX_DAMAGE_RECTS {
+            self.full = true;
+            self.rects.clear();
+            return;
+        }
+
+        let frame_area = frame_size.width as u64 * frame_size.height as u64;
+        if frame_area == 0 {
+            self.full = true;
+            self.rects.clear();
+            return;
+        }
+
+        let damaged_area = self
+            .rects
+            .iter()
+            .map(DamageRect::area)
+            .sum::<u64>()
+            .min(frame_area);
+        if damaged_area * 100 >= frame_area * FULL_DAMAGE_AREA_PERCENT {
+            self.full = true;
+            self.rects.clear();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CaptureError {
     Anyhow(anyhow::Error),
@@ -344,18 +488,33 @@ impl DirectCapture {
         target: &CaptureTarget,
         paint_cursors: bool,
         buffer: &DirectCaptureBuffer,
-    ) -> Result<(), CaptureError> {
+        damage: &DamageSet,
+    ) -> Result<Vec<DamageRect>, CaptureError> {
         let (mut state, mut event_queue, frame) =
             self.create_frame(target, paint_cursors, false)?;
 
         frame.attach_buffer(buffer.wl_buffer());
-        frame.damage_buffer(0, 0, buffer.size().width as i32, buffer.size().height as i32);
+        let damage_rects = damage.rects_for_frame(buffer.size());
+        if damage_rects.is_empty() {
+            debug!("capturing frame with no pending client damage");
+        } else if damage.is_full() {
+            debug!(
+                "capturing frame with full client damage at {}x{}",
+                buffer.size().width,
+                buffer.size().height
+            );
+        } else {
+            debug!("capturing frame with {} client damage rects", damage_rects.len());
+        }
+        for rect in damage_rects {
+            frame.damage_buffer(rect.x, rect.y, rect.width, rect.height);
+        }
         frame.capture();
 
         loop {
             if let Some(frame_state) = state.frame_state {
                 return match frame_state {
-                    FrameState::Ready => Ok(()),
+                    FrameState::Ready => Ok(state.damage_rects),
                     FrameState::Failed(WEnum::Value(FailureReason::BufferConstraints)) => {
                         Err(CaptureError::BufferConstraints)
                     }
@@ -711,6 +870,7 @@ struct CaptureState {
     find_gbm: bool,
     toplevels: Vec<ToplevelInfo>,
     buffer_create: Option<BufferCreateState>,
+    damage_rects: Vec<DamageRect>,
 }
 
 impl CaptureState {
@@ -725,6 +885,7 @@ impl CaptureState {
             find_gbm,
             toplevels: Vec::new(),
             buffer_create: None,
+            damage_rects: Vec::new(),
         }
     }
 }
@@ -827,6 +988,19 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for CaptureState {
         match event {
             ext_image_copy_capture_frame_v1::Event::Ready => {
                 state.frame_state = Some(FrameState::Ready);
+            }
+            ext_image_copy_capture_frame_v1::Event::Damage {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.damage_rects.push(DamageRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
             }
             ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
                 state.frame_state = Some(FrameState::Failed(reason));

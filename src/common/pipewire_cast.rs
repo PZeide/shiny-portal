@@ -23,8 +23,8 @@ use tracing::{debug, error, info, warn};
 use wayland_client::protocol::wl_shm;
 
 use crate::common::wayland_capture::{
-    CaptureError, CaptureProbe, CaptureTarget, DirectCapture, DirectCaptureBuffer,
-    DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, DmabufFormat, Size, fourcc,
+    CaptureError, CaptureProbe, CaptureTarget, DamageRect, DamageSet, DirectCapture,
+    DirectCaptureBuffer, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, DmabufFormat, Size, fourcc,
 };
 
 pub struct ScreencastThread {
@@ -156,6 +156,12 @@ struct StreamingData {
     chosen_format: Option<VideoFormat>,
     chosen_modifier: Option<u64>,
     allow_shm_fallback: bool,
+    buffers: Vec<*mut pipewire::sys::pw_buffer>,
+}
+
+struct StreamBuffer {
+    capture: DirectCaptureBuffer,
+    pending_damage: DamageSet,
 }
 
 impl StreamingData {
@@ -172,13 +178,17 @@ impl StreamingData {
             return;
         }
 
-        let capture_buffer = unsafe { &mut *(user_data as *mut DirectCaptureBuffer) };
+        let stream_buffer = unsafe { &mut *(user_data as *mut StreamBuffer) };
 
-        match self
-            .capture
-            .capture_into_buffer(&self.target, self.overlay_cursor, capture_buffer)
-        {
-            Ok(()) => {}
+        match self.capture.capture_into_buffer(
+            &self.target,
+            self.overlay_cursor,
+            &stream_buffer.capture,
+            &stream_buffer.pending_damage,
+        ) {
+            Ok(frame_damage) => {
+                self.update_buffer_damage(buffer, &frame_damage);
+            }
             Err(CaptureError::BufferConstraints) => {
                 warn!("capture reported new buffer constraints; updating PipeWire params");
                 match self.capture.probe(&self.target, self.overlay_cursor) {
@@ -186,6 +196,7 @@ impl StreamingData {
                         match StreamFormatState::from_probe(probe, self.allow_shm_fallback) {
                             Ok(formats) => {
                                 self.formats = formats;
+                                self.reset_buffer_damage();
                                 let format = format_param(
                                     self.formats.size.width,
                                     self.formats.size.height,
@@ -297,9 +308,7 @@ impl StreamingData {
                 chunk.stride = stride as i32;
             }
 
-            unsafe {
-                (*buffer).user_data = Box::into_raw(Box::new(capture_buffer)) as *mut c_void;
-            }
+            self.attach_capture_buffer(buffer, capture_buffer);
             return;
         }
 
@@ -354,12 +363,28 @@ impl StreamingData {
         chunk.offset = 0;
         chunk.stride = 4 * size.width as i32;
 
+        self.attach_capture_buffer(buffer, capture_buffer);
+    }
+
+    fn attach_capture_buffer(
+        &mut self,
+        buffer: *mut pipewire::sys::pw_buffer,
+        capture: DirectCaptureBuffer,
+    ) {
         unsafe {
-            (*buffer).user_data = Box::into_raw(Box::new(capture_buffer)) as *mut c_void;
+            (*buffer).user_data = Box::into_raw(Box::new(StreamBuffer {
+                capture,
+                pending_damage: DamageSet::full(),
+            })) as *mut c_void;
+        }
+        if !self.buffers.contains(&buffer) {
+            self.buffers.push(buffer);
         }
     }
 
-    fn remove_buffer(&self, buffer: *mut pipewire::sys::pw_buffer) {
+    fn remove_buffer(&mut self, buffer: *mut pipewire::sys::pw_buffer) {
+        self.buffers.retain(|candidate| *candidate != buffer);
+
         let buf = unsafe { &mut *(*buffer).buffer };
         let datas = unsafe { slice::from_raw_parts_mut(buf.datas, buf.n_datas as usize) };
 
@@ -374,11 +399,56 @@ impl StreamingData {
         }
 
         if !unsafe { (*buffer).user_data }.is_null() {
-            let capture_buffer: Box<DirectCaptureBuffer> =
+            let stream_buffer: Box<StreamBuffer> =
                 unsafe { Box::from_raw((*buffer).user_data as *mut _) };
-            drop(capture_buffer);
+            drop(stream_buffer);
             unsafe { (*buffer).user_data = std::ptr::null_mut() };
         }
+    }
+
+    fn update_buffer_damage(
+        &mut self,
+        current_buffer: *mut pipewire::sys::pw_buffer,
+        frame_damage: &[DamageRect],
+    ) {
+        let mut propagated_buffers = 0;
+        for buffer in &self.buffers {
+            let user_data = unsafe { (**buffer).user_data };
+            if user_data.is_null() {
+                continue;
+            }
+
+            let stream_buffer = unsafe { &mut *(user_data as *mut StreamBuffer) };
+            if *buffer == current_buffer {
+                stream_buffer.pending_damage = DamageSet::empty();
+            } else {
+                stream_buffer
+                    .pending_damage
+                    .add_many(frame_damage, self.formats.size);
+                propagated_buffers += 1;
+            }
+        }
+
+        if !frame_damage.is_empty() {
+            debug!(
+                "captured frame reported {} damage rects; propagated to {} queued buffers",
+                frame_damage.len(),
+                propagated_buffers
+            );
+        }
+    }
+
+    fn reset_buffer_damage(&mut self) {
+        for buffer in &self.buffers {
+            let user_data = unsafe { (**buffer).user_data };
+            if user_data.is_null() {
+                continue;
+            }
+
+            let stream_buffer = unsafe { &mut *(user_data as *mut StreamBuffer) };
+            stream_buffer.pending_damage = DamageSet::full();
+        }
+        debug!("reset pending damage to full for {} PipeWire buffers", self.buffers.len());
     }
 
     fn param_changed(&mut self, id: u32, pod: Option<&Pod>) {
@@ -406,7 +476,6 @@ impl StreamingData {
             Err(err) => error!("could not parse PipeWire format: {err}"),
         }
     }
-
 }
 
 type PipewireStreamResult = (
@@ -463,6 +532,7 @@ fn start_stream(
             chosen_format: None,
             chosen_modifier: None,
             allow_shm_fallback,
+            buffers: Vec::new(),
         })
         .state_changed(move |stream, _, old, new| {
             info!("PipeWire stream state changed: {old:?} -> {new:?}");

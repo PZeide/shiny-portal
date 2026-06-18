@@ -136,6 +136,37 @@ impl ShinyShell {
         Ok(rx)
     }
 
+    pub async fn region_selector(
+        &self,
+        options: RegionSelectorOptions,
+    ) -> Result<RegionSelectorResult, ShellError> {
+        let json = serde_json::to_string(&options)?;
+        let request_id = self
+            .call::<RegionSelectorRequestResult>("region-selector", "request", &[&json])
+            .await?
+            .0;
+
+        let mut rx = self
+            .listen::<RegionSelectorResult>("region-selector", "result")
+            .await?;
+
+        while let Some(result) = rx.recv().await {
+            match &result {
+                RegionSelectorResult::Selected { key, .. }
+                | RegionSelectorResult::Cancelled { key }
+                    if key == &request_id =>
+                {
+                    return Ok(result);
+                }
+                _ => {}
+            }
+        }
+
+        Err(ShellError::Ipc(
+            "stream closed without picker result".into(),
+        ))
+    }
+
     pub async fn share_picker(
         &self,
         options: SharePickerOptions,
@@ -168,10 +199,33 @@ impl ShinyShell {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct CustomRegion {
+    pub monitor: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Deserialize, Debug)]
+struct RegionSelectorRequestResult(String);
+
+#[derive(Deserialize, Debug)]
 struct SharePickerRequestResult(String);
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "status", rename_all = "camelCase")]
+#[allow(dead_code)]
+pub enum RegionSelectorResult {
+    Selected { key: String, result: CustomRegion },
+    Cancelled { key: String },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "status", rename_all = "camelCase")]
+#[allow(dead_code)]
 pub enum SharePickerResult {
     Selected {
         key: String,
@@ -204,19 +258,18 @@ pub enum SelectionResult {
     },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-pub struct CustomRegion {
-    pub monitor: String,
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
+pub struct RegionSelectorOptions {
+    pub freeze: Option<bool>,
+    pub hint_windows: Option<bool>,
+    pub hint_layers: Option<bool>,
 }
 
 #[derive(Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct SharePickerOptions {
     pub allow_monitor: Option<bool>,
     pub allow_window: Option<bool>,

@@ -5,21 +5,25 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 enumflags2 = "0.7.12"
 futures-util = "0.3.32"
-drm = "0.14.1"
+drm = "0.15.0"
 gbm = "0.18.0"
-pipewire = { version = "0.9.2", features = ["v0_3_77"] }
+pipewire = { version = "0.10.0", features = ["v0_3_77"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_repr = "0.1.20"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wayland-client = "0.31.14"
-wayland-protocols = { version = "0.32.12", features = ["client", "staging", "unstable"] }
-zbus = { version = "5.15.0", features = ["tokio"] }
-zvariant = { version = "5.11.0", features = ["enumflags2"] }
+wayland-protocols = { version = "0.32.12", features = [
+    "client",
+    "staging",
+    "unstable",
+] }
+zbus = { version = "5.16.0", features = ["tokio"] }
+zvariant = { version = "5.12.0", features = ["enumflags2"] }

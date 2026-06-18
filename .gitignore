@@ -22,5 +22,3 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
-
-OLD/

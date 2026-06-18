@@ -7,7 +7,6 @@
   libGL,
   wayland,
   pipewire,
-  libxkbcommon,
   ...
 }:
 rustPlatform.buildRustPackage {
@@ -30,7 +29,6 @@ rustPlatform.buildRustPackage {
     libGL
     wayland
     pipewire
-    libxkbcommon
   ];
 
   postPatch = ''

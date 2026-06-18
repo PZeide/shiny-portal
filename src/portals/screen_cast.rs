@@ -45,6 +45,9 @@ pub enum PersistMode {
     Explicit = 2,
 }
 
+const RESTORE_DATA_VENDOR: &str = "shiny";
+const RESTORE_DATA_VERSION: u32 = 1;
+
 #[derive(SerializeDict, Debug, Type)]
 #[zvariant(signature = "a{sv}")]
 struct CreateSessionResult {
@@ -87,6 +90,13 @@ struct StartResult {
     streams: Vec<Stream>,
     persist_mode: Option<PersistMode>,
     restore_data: Option<RestoreData>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum RestoreTokenPayload {
+    Monitor { monitor: String },
+    Window { stable_id: String },
 }
 
 #[derive(Debug)]
@@ -146,9 +156,7 @@ impl ScreenCastPortal {
     ) -> zbus::fdo::Result<PortalResponse<CreateSessionResult>> {
         info!("creating screencast session for app {app_id} at {session_handle}");
 
-        Request::register(connection.object_server(), &request_handle, (), |_| async {
-        })
-        .await?;
+        Request::register(connection.object_server(), &request_handle).await?;
 
         Session::register(
             connection.object_server(),
@@ -187,9 +195,7 @@ impl ScreenCastPortal {
         options: SelectSourcesOptions,
     ) -> zbus::fdo::Result<PortalResponse> {
         info!("selecting screencast sources for app {app_id} in {session_handle}");
-        Request::register(connection.object_server(), &request_handle, (), |_| async {
-        })
-        .await?;
+        Request::register(connection.object_server(), &request_handle).await?;
 
         let Some(session_interface) =
             Session::<ScreenCastSession>::get(connection.object_server(), &session_handle).await
@@ -210,7 +216,8 @@ impl ScreenCastPortal {
 
         if let Some(mode) = options.cursor_mode {
             if mode == CursorMode::Metadata {
-                warn!("metadata cursor mode is unsupported; keeping previous cursor mode");
+                warn!("metadata cursor mode is unsupported; using embedded cursor mode");
+                session.inner.options.cursor_mode = CursorMode::Embedded;
             } else {
                 session.inner.options.cursor_mode = mode;
             }
@@ -242,9 +249,7 @@ impl ScreenCastPortal {
         _options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse<StartResult>> {
         info!("starting screencast for app {app_id} in {session_handle}");
-        Request::register(connection.object_server(), &request_handle, (), |_| async {
-        })
-        .await?;
+        Request::register(connection.object_server(), &request_handle).await?;
 
         let Some(session_interface) =
             Session::<ScreenCastSession>::get(connection.object_server(), &session_handle).await
@@ -255,78 +260,100 @@ impl ScreenCastPortal {
 
         let mut session = session_interface.get_mut().await;
         let options = &session.inner.options;
-
-        let share_result = match self
-            .shell
-            .share_picker(SharePickerOptions {
-                allow_monitor: Some(options.source_types.contains(SourceType::Monitor)),
-                allow_window: Some(options.source_types.contains(SourceType::Window)),
-                allow_custom_region: Some(false),
-                allow_restore_token_default: None,
-                dialog_parent_window_handle: Some(parent_window),
-            })
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                warn!("share picker failed: {err}");
-                return Ok(PortalResponse::Other);
-            }
-        };
-
-        let SharePickerResult::Selected {
-            result: selection, ..
-        } = share_result
-        else {
-            info!("share picker was cancelled");
-            return Ok(PortalResponse::Cancelled);
-        };
-
+        let persist_mode = options.persist_mode;
         let overlay_cursor = options.cursor_mode == CursorMode::Embedded;
 
         let Ok(capture) = DirectCapture::connect() else {
-            warn!("failed to create direct Wayland capture connection");
+            warn!("failed to create wayland capture connection");
             return Ok(PortalResponse::Other);
         };
 
-        let (target, source_type) = match selection {
-            SelectionResult::Monitor { monitor, .. } => {
-                let Some(output) = capture
-                    .outputs()
-                    .iter()
-                    .find(|o| o.name == monitor)
-                else {
-                    warn!("selected monitor {monitor} was not found");
-                    return Ok(PortalResponse::Other);
+        let restored_source = options
+            .restore_data
+            .as_ref()
+            .and_then(decode_restore_data)
+            .and_then(|payload| resolve_restore_payload(&capture, options.source_types, payload));
+
+        let (target, source_type, restore_payload, allow_restore_token) =
+            if let Some(restored_source) = restored_source {
+                info!("restored screencast source from portal restore data");
+                restored_source
+            } else {
+                let share_result = match self
+                    .shell
+                    .share_picker(SharePickerOptions {
+                        allow_monitor: Some(
+                            options.source_types.contains(SourceType::Monitor),
+                        ),
+                        allow_window: Some(options.source_types.contains(SourceType::Window)),
+                        allow_custom_region: Some(false),
+                        allow_restore_token_default: restore_token_default(options),
+                        dialog_parent_window_handle: Some(parent_window),
+                    })
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        warn!("share picker failed: {err}");
+                        return Ok(PortalResponse::Other);
+                    }
                 };
 
-                info!("selected monitor source: {monitor}");
-                (
-                    CaptureTarget::Output(output.output.clone()),
-                    SourceType::Monitor,
-                )
-            }
-            SelectionResult::Window { stable_id, .. } => {
-                let Some(window) = capture
-                    .toplevels()
-                    .iter()
-                    .find(|w| w.identifier == stable_id)
+                let SharePickerResult::Selected {
+                    result: selection, ..
+                } = share_result
                 else {
-                    warn!("selected window {stable_id} was not found");
-                    return Ok(PortalResponse::Other);
+                    info!("share picker was cancelled");
+                    return Ok(PortalResponse::Cancelled);
                 };
 
-                info!("selected window source: {stable_id}");
-                (
-                    CaptureTarget::Toplevel(window.handle.clone()),
-                    SourceType::Window,
-                )
-            }
-            SelectionResult::Custom { region, .. } => {
-                warn!("custom region capture is not implemented: {region:?}");
-                return Ok(PortalResponse::Other);
-            }
-        };
+                match selection {
+                    SelectionResult::Monitor {
+                        monitor,
+                        allow_restore_token,
+                    } => {
+                        let Some(output) = capture.outputs().iter().find(|o| o.name == monitor)
+                        else {
+                            warn!("selected monitor {monitor} was not found");
+                            return Ok(PortalResponse::Other);
+                        };
+
+                        info!("selected monitor source: {monitor}");
+                        (
+                            CaptureTarget::Output(output.output.clone()),
+                            SourceType::Monitor,
+                            RestoreTokenPayload::Monitor { monitor },
+                            allow_restore_token,
+                        )
+                    }
+                    SelectionResult::Window {
+                        stable_id,
+                        allow_restore_token,
+                        ..
+                    } => {
+                        let Some(window) = capture
+                            .toplevels()
+                            .iter()
+                            .find(|w| w.identifier == stable_id)
+                        else {
+                            warn!("selected window {stable_id} was not found");
+                            return Ok(PortalResponse::Other);
+                        };
+
+                        info!("selected window source: {stable_id}");
+                        (
+                            CaptureTarget::Toplevel(window.handle.clone()),
+                            SourceType::Window,
+                            RestoreTokenPayload::Window { stable_id },
+                            allow_restore_token,
+                        )
+                    }
+                    SelectionResult::Custom { region, .. } => {
+                        warn!("custom region capture is not implemented: {region:?}");
+                        return Ok(PortalResponse::Other);
+                    }
+                }
+            };
 
         let cast_thread = ScreencastThread::start_cast(overlay_cursor, target, capture)
             .await
@@ -340,6 +367,13 @@ impl ScreenCastPortal {
 
         info!("screencast started with PipeWire node id {node_id}");
 
+        let restore_data = if should_return_restore_token(persist_mode, allow_restore_token) {
+            restore_data_from_payload(restore_payload)
+        } else {
+            None
+        };
+        let persist_mode = restore_data.as_ref().map(|_| persist_mode);
+
         Ok(PortalResponse::Success(StartResult {
             streams: vec![Stream(
                 node_id,
@@ -350,8 +384,111 @@ impl ScreenCastPortal {
                     mapping_id: None,
                 },
             )],
-            persist_mode: None,
-            restore_data: None,
+            persist_mode,
+            restore_data,
         }))
+    }
+}
+
+fn restore_token_default(options: &ScreenCastOptions) -> Option<bool> {
+    match options.persist_mode {
+        PersistMode::DoNot => None,
+        PersistMode::Application => Some(true),
+        PersistMode::Explicit => Some(options.restore_data.is_some()),
+    }
+}
+
+fn should_return_restore_token(persist_mode: PersistMode, allow_restore_token: bool) -> bool {
+    persist_mode != PersistMode::DoNot && allow_restore_token
+}
+
+fn restore_data_from_payload(payload: RestoreTokenPayload) -> Option<RestoreData> {
+    let data = match serde_json::to_string(&payload) {
+        Ok(data) => data,
+        Err(err) => {
+            warn!("failed to serialize restore token payload: {err}");
+            return None;
+        }
+    };
+
+    Some(RestoreData {
+        vendor: RESTORE_DATA_VENDOR.into(),
+        version: RESTORE_DATA_VERSION,
+        data: zvariant::OwnedValue::from(zvariant::Str::from(data)),
+    })
+}
+
+fn decode_restore_data(restore_data: &RestoreData) -> Option<RestoreTokenPayload> {
+    if restore_data.vendor != RESTORE_DATA_VENDOR || restore_data.version != RESTORE_DATA_VERSION {
+        warn!(
+            "ignoring unsupported restore data vendor={} version={}",
+            restore_data.vendor, restore_data.version
+        );
+        return None;
+    }
+
+    let data = match restore_data.data.try_clone().and_then(String::try_from) {
+        Ok(data) => data,
+        Err(err) => {
+            warn!("ignoring restore data with invalid payload type: {err}");
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&data) {
+        Ok(payload) => Some(payload),
+        Err(err) => {
+            warn!("ignoring malformed restore data payload: {err}");
+            None
+        }
+    }
+}
+
+fn resolve_restore_payload(
+    capture: &DirectCapture,
+    source_types: BitFlags<SourceType>,
+    payload: RestoreTokenPayload,
+) -> Option<(CaptureTarget, SourceType, RestoreTokenPayload, bool)> {
+    match payload {
+        RestoreTokenPayload::Monitor { monitor } => {
+            if !source_types.contains(SourceType::Monitor) {
+                warn!("ignoring restored monitor because monitor capture was not requested");
+                return None;
+            }
+
+            let Some(output) = capture.outputs().iter().find(|output| output.name == monitor) else {
+                warn!("restored monitor {monitor} is no longer available");
+                return None;
+            };
+
+            Some((
+                CaptureTarget::Output(output.output.clone()),
+                SourceType::Monitor,
+                RestoreTokenPayload::Monitor { monitor },
+                true,
+            ))
+        }
+        RestoreTokenPayload::Window { stable_id } => {
+            if !source_types.contains(SourceType::Window) {
+                warn!("ignoring restored window because window capture was not requested");
+                return None;
+            }
+
+            let Some(window) = capture
+                .toplevels()
+                .iter()
+                .find(|window| window.identifier == stable_id)
+            else {
+                warn!("restored window {stable_id} is no longer available");
+                return None;
+            };
+
+            Some((
+                CaptureTarget::Toplevel(window.handle.clone()),
+                SourceType::Window,
+                RestoreTokenPayload::Window { stable_id },
+                true,
+            ))
+        }
     }
 }
