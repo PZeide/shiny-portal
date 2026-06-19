@@ -16,7 +16,7 @@ use pipewire::{
             format::{FormatProperties, MediaSubtype, MediaType},
             video::{VideoFormat, VideoInfoRaw},
         },
-        pod::{self, Pod, serialize::PodSerializer},
+        pod::{self, Pod, deserialize::PodDeserializer, serialize::PodSerializer},
         sys as spa_sys,
     },
     stream::StreamState,
@@ -112,62 +112,93 @@ impl ScreencastThread {
 #[derive(Debug, Clone)]
 struct StreamFormatState {
     size: Size,
-    spa_formats: Vec<VideoFormat>,
-    modifiers: Vec<u64>,
+    offers: Vec<StreamFormatOffer>,
     dmabuf_supported: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StreamFormatOffer {
+    spa_format: VideoFormat,
+    modifiers: Vec<u64>,
 }
 
 impl StreamFormatState {
     fn from_probe(probe: CaptureProbe, allow_shm_fallback: bool) -> anyhow::Result<Self> {
         let dmabuf_available = probe.has_dmabuf_device && !probe.dmabuf_formats.is_empty();
         if !dmabuf_available && !allow_shm_fallback {
-            anyhow::bail!("compositor did not advertise a usable DMA-BUF capture path");
+            anyhow::bail!("compositor did not advertise a usable dma-buf capture path");
         }
 
-        let mut spa_formats = Vec::new();
-        let mut modifiers = Vec::new();
+        let mut offers = Vec::new();
+
         if dmabuf_available {
             for format in &probe.dmabuf_formats {
                 let Some(spa_format) = drm_fourcc_to_spa(format.fourcc) else {
                     continue;
                 };
 
-                if !spa_formats.contains(&spa_format) {
-                    spa_formats.push(spa_format);
+                if format.modifiers.is_empty() {
+                    continue;
                 }
-                for modifier in &format.modifiers {
-                    if !modifiers.contains(modifier) {
-                        modifiers.push(*modifier);
-                    }
-                }
+
+                offers.push(StreamFormatOffer {
+                    spa_format,
+                    modifiers: format.modifiers.clone(),
+                });
             }
         }
 
-        let dmabuf_supported = !spa_formats.is_empty() && !modifiers.is_empty();
+        let dmabuf_supported = !offers.is_empty();
         if !dmabuf_supported && !allow_shm_fallback {
-            anyhow::bail!("compositor did not advertise usable DMA-BUF formats and modifiers");
+            anyhow::bail!("compositor did not advertise usable dma-buf formats and modifiers");
         }
 
-        if spa_formats.is_empty() && allow_shm_fallback {
+        if allow_shm_fallback {
             for format in &probe.shm_formats {
                 if let Some(spa_format) = shm_format_to_spa(format.format)
-                    && !spa_formats.contains(&spa_format)
+                    && !offers
+                        .iter()
+                        .any(|offer| offer.spa_format == spa_format && offer.modifiers.is_empty())
                 {
-                    spa_formats.push(spa_format);
+                    offers.push(StreamFormatOffer {
+                        spa_format,
+                        modifiers: Vec::new(),
+                    });
                 }
             }
         }
 
-        if spa_formats.is_empty() {
-            anyhow::bail!("no capture formats could be mapped to PipeWire SPA video formats");
+        if offers.is_empty() {
+            anyhow::bail!("no capture formats could be mapped to pw spa video formats");
         }
 
         Ok(Self {
             size: probe.size,
-            spa_formats,
-            modifiers,
+            offers,
             dmabuf_supported,
         })
+    }
+
+    fn format_params(&self, max_fps: u32) -> Vec<Vec<u8>> {
+        self.offers
+            .iter()
+            .map(|offer| {
+                format_param(
+                    self.size.width,
+                    self.size.height,
+                    offer.spa_format,
+                    &offer.modifiers,
+                    max_fps,
+                )
+            })
+            .collect()
+    }
+
+    fn fallback_modifier(&self, format: VideoFormat) -> Option<u64> {
+        self.offers
+            .iter()
+            .find(|offer| offer.spa_format == format)
+            .and_then(|offer| offer.modifiers.first().copied())
     }
 }
 
@@ -197,7 +228,7 @@ impl StreamingData {
 
         let user_data = unsafe { (*buffer).user_data };
         if user_data.is_null() {
-            error!("PipeWire buffer has no capture buffer attached");
+            error!("pw buffer has no capture buffer attached");
             unsafe { stream.queue_raw_buffer(buffer) };
             return;
         }
@@ -213,7 +244,7 @@ impl StreamingData {
                 self.update_buffer_damage(buffer, &frame_damage);
             }
             Err(CaptureError::BufferConstraints) => {
-                warn!("capture reported new buffer constraints; updating PipeWire params");
+                warn!("capture reported new buffer constraints; updating pw params");
                 match self.capture.probe(&self.target, self.overlay_cursor) {
                     Ok(probe) => {
                         match StreamFormatState::from_probe(probe, self.allow_shm_fallback) {
@@ -221,28 +252,16 @@ impl StreamingData {
                                 self.formats = formats;
                                 self.reset_buffer_damage();
 
-                                let format = format_param(
-                                    self.formats.size.width,
-                                    self.formats.size.height,
-                                    &self.formats.spa_formats,
-                                    &self.formats.modifiers,
-                                    self.max_fps,
-                                );
+                                let formats = self.formats.format_params(self.max_fps);
+                                let mut params = formats
+                                    .iter()
+                                    .map(|format| {
+                                        Pod::from_bytes(format).expect("format pod must be valid")
+                                    })
+                                    .collect::<Vec<_>>();
 
-                                let buffers = buffer_param(
-                                    self.formats.size.width,
-                                    self.formats.size.height,
-                                    self.formats.dmabuf_supported,
-                                    self.allow_shm_fallback,
-                                );
-
-                                let params = &mut [
-                                    Pod::from_bytes(&format).expect("format pod must be valid"),
-                                    Pod::from_bytes(&buffers).expect("buffer pod must be valid"),
-                                ];
-
-                                if let Err(err) = stream.update_params(params) {
-                                    error!("failed to update PipeWire params: {err}");
+                                if let Err(err) = stream.update_params(&mut params) {
+                                    error!("failed to update pw params: {err}");
                                 }
                             }
                             Err(err) => error!("could not rebuild capture format state: {err}"),
@@ -269,9 +288,10 @@ impl StreamingData {
 
         if wants_dmabuf && self.formats.dmabuf_supported {
             let selected_fourcc = self.chosen_format.and_then(spa_to_drm_fourcc);
-            let selected_modifier = self
-                .chosen_modifier
-                .or_else(|| self.formats.modifiers.first().copied());
+            let selected_modifier = self.chosen_modifier.or_else(|| {
+                self.chosen_format
+                    .and_then(|format| self.formats.fallback_modifier(format))
+            });
 
             let capture_buffer = match self.capture.create_dmabuf_buffer(
                 &self.target,
@@ -280,37 +300,46 @@ impl StreamingData {
             ) {
                 Ok(buffer) => buffer,
                 Err(err) => {
-                    error!("direct DMA-BUF capture buffer allocation failed: {err}");
+                    error!("direct dma-buf capture buffer allocation failed: {err}");
                     return;
                 }
             };
 
             let Some(bo) = capture_buffer.dmabuf_bo() else {
-                error!("DMA-BUF capture allocation returned a non-DMA-BUF buffer");
+                error!("dma-buf capture allocation returned a non-dma-buf buffer");
                 return;
             };
 
             let Some(format) = capture_buffer.dmabuf_format() else {
-                error!("DMA-BUF capture buffer did not expose a format");
+                error!("dma-buf capture buffer did not expose a format");
                 return;
             };
 
             let Some(modifier) = capture_buffer.modifier() else {
-                error!("DMA-BUF capture buffer did not expose a modifier");
+                error!("dma-buf capture buffer did not expose a modifier");
                 return;
             };
+
             let plane_count = bo.plane_count() as usize;
+            if datas.len() != plane_count {
+                error!(
+                    "pw allocated {} dma-buf data blocks, but gbm buffer has {} planes",
+                    datas.len(),
+                    plane_count
+                );
+                return;
+            }
 
             info!(
-                "allocating PipeWire DMA-BUF buffer: fourcc=0x{:08x}, size={}x{}, planes={}, modifier=0x{:016x}",
+                "allocating pw dma-buf buffer: fourcc=0x{:08x}, size={}x{}, planes={}, modifier=0x{:016x}",
                 format.fourcc, format.size.width, format.size.height, plane_count, modifier
             );
 
-            for (index, data) in datas.iter_mut().take(plane_count).enumerate() {
+            for (index, data) in datas.iter_mut().enumerate() {
                 let fd = match bo.fd_for_plane(index as i32) {
                     Ok(fd) => fd,
                     Err(err) => {
-                        error!("failed to export DMA-BUF plane {index}: {err}");
+                        error!("failed to export dma-buf plane {index}: {err}");
                         return;
                     }
                 };
@@ -319,7 +348,7 @@ impl StreamingData {
                 let stride = bo.stride_for_plane(index as i32);
 
                 debug!(
-                    "PipeWire DMA-BUF plane {index}: offset={offset}, stride={stride}, maxsize={}",
+                    "pw dma-buf plane {index}: offset={offset}, stride={stride}, maxsize={}",
                     format.size.width * format.size.height * 4
                 );
 
@@ -342,15 +371,15 @@ impl StreamingData {
 
         if !self.allow_shm_fallback {
             error!(
-                "PipeWire did not allocate DMA-BUF although SHM fallback is disabled; datas[0].type={:?}",
+                "pw did not allocate dma-buf although shm fallback is disabled; datas[0].type={:?}",
                 datas.first().map(|data| data.type_)
             );
             return;
         }
 
-        warn!("allocating PipeWire SHM buffer because DMA-BUF was not selected");
+        warn!("allocating pw shm buffer because dma-buf was not selected");
         if datas.len() != 1 {
-            error!("expected one SHM PipeWire data block, got {}", datas.len());
+            error!("expected one shm pw data block, got {}", datas.len());
             return;
         }
 
@@ -360,13 +389,13 @@ impl StreamingData {
         let fd = match rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) {
             Ok(fd) => fd,
             Err(err) => {
-                error!("failed to create memfd for SHM fallback: {err}");
+                error!("failed to create memfd for shm fallback: {err}");
                 return;
             }
         };
 
         if let Err(err) = rustix::fs::ftruncate(&fd, (size.width * size.height * 4) as _) {
-            error!("failed to resize memfd for SHM fallback: {err}");
+            error!("failed to resize memfd for shm fallback: {err}");
             return;
         }
 
@@ -378,7 +407,7 @@ impl StreamingData {
             {
                 Ok(buffer) => buffer,
                 Err(err) => {
-                    error!("direct SHM capture buffer allocation failed: {err}");
+                    error!("direct shm capture buffer allocation failed: {err}");
                     return;
                 }
             };
@@ -425,7 +454,7 @@ impl StreamingData {
             if data.fd >= 0 {
                 match data.fd.try_into() {
                     Ok(fd) => unsafe { rustix::io::close(fd) },
-                    Err(err) => error!("invalid PipeWire buffer fd {}: {err}", data.fd),
+                    Err(err) => error!("invalid pw buffer fd {}: {err}", data.fd),
                 }
                 data.fd = -1;
             }
@@ -483,12 +512,12 @@ impl StreamingData {
         }
 
         debug!(
-            "reset pending damage to full for {} PipeWire buffers",
+            "reset pending damage to full for {} pw buffers",
             self.buffers.len()
         );
     }
 
-    fn param_changed(&mut self, id: u32, pod: Option<&Pod>) {
+    fn param_changed(&mut self, stream: &pipewire::stream::Stream, id: u32, pod: Option<&Pod>) {
         if id != spa_sys::SPA_PARAM_Format {
             return;
         }
@@ -501,22 +530,96 @@ impl StreamingData {
         match info.parse(pod) {
             Ok(_) => {
                 self.chosen_format = Some(info.format());
-                self.chosen_modifier = Some(info.modifier());
+                let modifier_flags = pod_modifier_flags(pod);
+                let uses_dmabuf = modifier_flags.is_some();
+                if modifier_flags
+                    .is_some_and(|flags| flags.contains(pod::PropertyFlags::DONT_FIXATE))
+                {
+                    let fixed_format = fixed_format_param(
+                        self.formats.size.width,
+                        self.formats.size.height,
+                        info.format(),
+                        info.modifier(),
+                        self.max_fps,
+                    );
+
+                    let format_params = self.formats.format_params(self.max_fps);
+                    let mut params = vec![
+                        Pod::from_bytes(&fixed_format).expect("fixed format pod must be valid"),
+                    ];
+
+                    params.extend(
+                        format_params.iter().map(|format| {
+                            Pod::from_bytes(format).expect("format pod must be valid")
+                        }),
+                    );
+
+                    info!(
+                        "fixating pw dma-buf format={:?}, modifier=0x{:016x}",
+                        info.format(),
+                        info.modifier()
+                    );
+
+                    if let Err(err) = stream.update_params(&mut params) {
+                        error!("failed to fixate selected pw format: {err}");
+                    }
+
+                    return;
+                }
+
+                let plane_count = if uses_dmabuf {
+                    self.chosen_modifier = Some(info.modifier());
+                    let Some(fourcc) = spa_to_drm_fourcc(info.format()) else {
+                        error!(
+                            "pw selected format {:?}, which has no drm fourcc mapping",
+                            info.format()
+                        );
+                        return;
+                    };
+                    match self.capture.dmabuf_plane_count(fourcc, info.modifier()) {
+                        Ok(plane_count) if plane_count > 0 => plane_count,
+                        Ok(_) => {
+                            error!("gbm returned zero dma-buf planes for selected format");
+                            return;
+                        }
+                        Err(err) => {
+                            error!("failed to determine selected dma-buf plane count: {err}");
+                            return;
+                        }
+                    }
+                } else {
+                    self.chosen_modifier = None;
+                    1
+                };
                 let framerate = info.framerate();
                 let max_framerate = info.max_framerate();
+
                 info!(
-                    "PipeWire selected format={:?}, drm_fourcc={:?}, shm={:?}, modifier=0x{:016x}, framerate={}/{}, max_framerate={}/{}",
+                    "pw selected format={:?}, drm_fourcc={:?}, shm={:?}, buffer_type={}, modifier=0x{:016x}, planes={}, framerate={}/{}, max_framerate={}/{}",
                     info.format(),
                     spa_to_drm_fourcc(info.format()).map(|fourcc| format!("0x{fourcc:08x}")),
                     spa_to_shm_format(info.format()),
+                    if uses_dmabuf { "dma-buf" } else { "shm" },
                     info.modifier(),
+                    plane_count,
                     framerate.num,
                     framerate.denom,
                     max_framerate.num,
                     max_framerate.denom
                 );
+
+                let buffers = buffer_param(
+                    self.formats.size.width,
+                    self.formats.size.height,
+                    plane_count,
+                    uses_dmabuf,
+                );
+                let mut params = [Pod::from_bytes(&buffers).expect("buffer pod must be valid")];
+                if let Err(err) = stream.update_params(&mut params) {
+                    error!("failed to publish selected pw buffer parameters: {err}");
+                }
             }
-            Err(err) => error!("could not parse PipeWire format: {err}"),
+            Err(err) => error!("could not parse pw format: {err}"),
         }
     }
 }
@@ -593,36 +696,38 @@ fn start_stream(
 
     let allow_shm_fallback = config.allow_shm;
     if allow_shm_fallback {
-        warn!("SHM fallback is enabled by configuration");
+        warn!("shm fallback is enabled by configuration");
     }
     if config.max_fps == 0 {
         info!("screencast capture rate is unlimited");
     } else {
-        info!("limiting screencast capture rate to {} FPS", config.max_fps);
+        info!("limiting screencast capture rate to {} fps", config.max_fps);
     }
 
     let probe = capture.probe(&target, overlay_cursor)?;
 
     for format in &probe.dmabuf_formats {
         debug!(
-            "wayland DMA-BUF format: fourcc=0x{:08x}, modifiers={:?}, size={}x{}",
+            "wayland dma-buf format: fourcc=0x{:08x}, modifiers={:?}, size={}x{}",
             format.fourcc, format.modifiers, format.size.width, format.size.height
         );
     }
 
     for format in &probe.shm_formats {
         debug!(
-            "wayland SHM format: {:?}, size={}x{}, stride={}",
+            "wayland shm format: {:?}, size={}x{}, stride={}",
             format.format, format.size.width, format.size.height, format.stride
         );
     }
 
     let formats = StreamFormatState::from_probe(probe, allow_shm_fallback)?;
 
-    info!(
-        "advertising PipeWire formats {:?} at {}x{} with DMA-BUF modifiers {:?}",
-        formats.spa_formats, formats.size.width, formats.size.height, formats.modifiers
-    );
+    for offer in &formats.offers {
+        info!(
+            "advertising pw format {:?} at {}x{} with dma-buf modifiers {:?}",
+            offer.spa_format, formats.size.width, formats.size.height, offer.modifiers
+        );
+    }
 
     let (node_id_tx, node_id_rx) = oneshot::channel();
     let stream_size = formats.size;
@@ -669,7 +774,7 @@ fn start_stream(
             buffers: Vec::new(),
         })
         .state_changed(move |stream, _, old, new| {
-            info!("PipeWire stream state changed: {old:?} -> {new:?}");
+            info!("pw stream state changed: {old:?} -> {new:?}");
             match new {
                 StreamState::Paused => {
                     let serial = stream
@@ -680,12 +785,12 @@ fn start_stream(
                         .borrow_mut()
                         .set_node(stream.node_id(), serial);
                 }
-                StreamState::Error(err) => error!("PipeWire stream error: {err}"),
+                StreamState::Error(err) => error!("pw stream error: {err}"),
                 _ => {}
             }
         })
-        .param_changed(|_, streaming_data, id, pod| {
-            streaming_data.param_changed(id, pod);
+        .param_changed(|stream, streaming_data, id, pod| {
+            streaming_data.param_changed(stream, id, pod);
         })
         .add_buffer(|_, streaming_data, buffer| {
             streaming_data.add_buffer(buffer);
@@ -698,31 +803,17 @@ fn start_stream(
         })
         .register()?;
 
-    let format = format_param(
-        formats.size.width,
-        formats.size.height,
-        &formats.spa_formats,
-        &formats.modifiers,
-        config.max_fps,
-    );
-
-    let buffers = buffer_param(
-        formats.size.width,
-        formats.size.height,
-        formats.dmabuf_supported,
-        allow_shm_fallback,
-    );
-
-    let params = &mut [
-        Pod::from_bytes(&format).expect("format pod must be valid"),
-        Pod::from_bytes(&buffers).expect("buffer pod must be valid"),
-    ];
+    let format_params = formats.format_params(config.max_fps);
+    let mut params = format_params
+        .iter()
+        .map(|format| Pod::from_bytes(format).expect("format pod must be valid"))
+        .collect::<Vec<_>>();
 
     stream.connect(
         spa::utils::Direction::Output,
         None,
         pipewire::stream::StreamFlags::ALLOC_BUFFERS,
-        params,
+        &mut params,
     )?;
 
     Ok((
@@ -743,89 +834,91 @@ fn value_to_bytes(value: pod::Value) -> Vec<u8> {
     bytes
 }
 
-fn buffer_param(
-    width: u32,
-    height: u32,
-    dmabuf_supported: bool,
-    allow_shm_fallback: bool,
-) -> Vec<u8> {
+fn pod_modifier_flags(pod: &Pod) -> Option<pod::PropertyFlags> {
+    PodDeserializer::deserialize_from::<pod::Value>(pod.as_bytes())
+        .ok()
+        .and_then(|(_, value)| {
+            let pod::Value::Object(object) = value else {
+                return None;
+            };
+            object
+                .properties
+                .iter()
+                .find(|property| property.key == FormatProperties::VideoModifier.as_raw())
+                .map(|property| property.flags)
+        })
+}
+
+fn buffer_param(width: u32, height: u32, blocks: u32, use_dmabuf: bool) -> Vec<u8> {
     let dmabuf_bit = 1 << spa_sys::SPA_DATA_DmaBuf;
     let memfd_bit = 1 << spa_sys::SPA_DATA_MemFd;
-    let data_type_flags = if dmabuf_supported {
-        if allow_shm_fallback {
-            vec![dmabuf_bit, memfd_bit]
-        } else {
-            vec![dmabuf_bit]
-        }
-    } else {
-        vec![memfd_bit]
-    };
-
-    let data_type_default = *data_type_flags.first().expect("buffer data type flags");
+    let data_type = if use_dmabuf { dmabuf_bit } else { memfd_bit };
 
     info!(
-        "advertising PipeWire buffer data types: default={}, flags={:?}",
-        data_type_default, data_type_flags
+        "advertising pw buffer data type={} with {} blocks",
+        data_type, blocks
     );
+
+    let mut properties = vec![
+        pod::Property {
+            key: spa_sys::SPA_PARAM_BUFFERS_dataType,
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Choice(pod::ChoiceValue::Int(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Flags {
+                    default: data_type as i32,
+                    flags: vec![data_type as i32],
+                },
+            ))),
+        },
+        pod::Property {
+            key: spa_sys::SPA_PARAM_BUFFERS_align,
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Int(16),
+        },
+        pod::Property {
+            key: spa_sys::SPA_PARAM_BUFFERS_blocks,
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Int(blocks as i32),
+        },
+        pod::Property {
+            key: spa_sys::SPA_PARAM_BUFFERS_buffers,
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Choice(pod::ChoiceValue::Int(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Range {
+                    default: 4,
+                    min: 1,
+                    max: 32,
+                },
+            ))),
+        },
+    ];
+
+    properties.extend([
+        pod::Property {
+            key: spa_sys::SPA_PARAM_BUFFERS_size,
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Int(width as i32 * height as i32 * 4),
+        },
+        pod::Property {
+            key: spa_sys::SPA_PARAM_BUFFERS_stride,
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Int(width as i32 * 4),
+        },
+    ]);
 
     value_to_bytes(pod::Value::Object(pod::Object {
         type_: spa_sys::SPA_TYPE_OBJECT_ParamBuffers,
         id: spa_sys::SPA_PARAM_Buffers,
-        properties: vec![
-            pod::Property {
-                key: spa_sys::SPA_PARAM_BUFFERS_dataType,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Choice(pod::ChoiceValue::Int(spa::utils::Choice(
-                    spa::utils::ChoiceFlags::empty(),
-                    spa::utils::ChoiceEnum::Flags {
-                        default: data_type_default as i32,
-                        flags: data_type_flags
-                            .into_iter()
-                            .map(|flag| flag as i32)
-                            .collect(),
-                    },
-                ))),
-            },
-            pod::Property {
-                key: spa_sys::SPA_PARAM_BUFFERS_size,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Int(width as i32 * height as i32 * 4),
-            },
-            pod::Property {
-                key: spa_sys::SPA_PARAM_BUFFERS_stride,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Int(width as i32 * 4),
-            },
-            pod::Property {
-                key: spa_sys::SPA_PARAM_BUFFERS_align,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Int(16),
-            },
-            pod::Property {
-                key: spa_sys::SPA_PARAM_BUFFERS_blocks,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Int(1),
-            },
-            pod::Property {
-                key: spa_sys::SPA_PARAM_BUFFERS_buffers,
-                flags: pod::PropertyFlags::empty(),
-                value: pod::Value::Choice(pod::ChoiceValue::Int(spa::utils::Choice(
-                    spa::utils::ChoiceFlags::empty(),
-                    spa::utils::ChoiceEnum::Range {
-                        default: 4,
-                        min: 1,
-                        max: 32,
-                    },
-                ))),
-            },
-        ],
+        properties,
     }))
 }
 
 fn format_param(
     width: u32,
     height: u32,
-    available_video_formats: &[VideoFormat],
+    video_format: VideoFormat,
     dmabuf_modifiers: &[u64],
     max_fps: u32,
 ) -> Vec<u8> {
@@ -875,22 +968,13 @@ fn format_param(
     obj.properties.push(pod::Property {
         key: FormatProperties::VideoFormat.as_raw(),
         flags: pod::PropertyFlags::empty(),
-        value: pod::Value::Choice(pod::ChoiceValue::Id(spa::utils::Choice(
-            spa::utils::ChoiceFlags::empty(),
-            spa::utils::ChoiceEnum::Enum {
-                default: spa::utils::Id(available_video_formats[0].as_raw()),
-                alternatives: available_video_formats
-                    .iter()
-                    .map(|format| spa::utils::Id(format.as_raw()))
-                    .collect(),
-            },
-        ))),
+        value: pod::Value::Id(spa::utils::Id(video_format.as_raw())),
     });
 
     if !dmabuf_modifiers.is_empty() {
         obj.properties.push(pod::Property {
             key: FormatProperties::VideoModifier.as_raw(),
-            flags: pod::PropertyFlags::empty(),
+            flags: pod::PropertyFlags::MANDATORY | pod::PropertyFlags::DONT_FIXATE,
             value: pod::Value::Choice(pod::ChoiceValue::Long(spa::utils::Choice(
                 spa::utils::ChoiceFlags::empty(),
                 spa::utils::ChoiceEnum::Enum {
@@ -899,6 +983,65 @@ fn format_param(
                         .iter()
                         .map(|modifier| *modifier as i64)
                         .collect(),
+                },
+            ))),
+        });
+    }
+
+    value_to_bytes(pod::Value::Object(obj))
+}
+
+fn fixed_format_param(
+    width: u32,
+    height: u32,
+    video_format: VideoFormat,
+    modifier: u64,
+    max_fps: u32,
+) -> Vec<u8> {
+    let mut obj = spa::pod::object!(
+        spa::utils::SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        spa::pod::property!(
+            FormatProperties::VideoSize,
+            Rectangle,
+            spa::utils::Rectangle { width, height }
+        ),
+        spa::pod::property!(
+            FormatProperties::VideoFramerate,
+            Fraction,
+            spa::utils::Fraction { num: 0, denom: 1 }
+        )
+    );
+
+    obj.properties.push(pod::Property {
+        key: FormatProperties::VideoFormat.as_raw(),
+        flags: pod::PropertyFlags::empty(),
+        value: pod::Value::Id(spa::utils::Id(video_format.as_raw())),
+    });
+    obj.properties.push(pod::Property {
+        key: FormatProperties::VideoModifier.as_raw(),
+        flags: pod::PropertyFlags::MANDATORY,
+        value: pod::Value::Long(modifier as i64),
+    });
+
+    if max_fps > 0 {
+        obj.properties.push(pod::Property {
+            key: FormatProperties::VideoMaxFramerate.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Choice(pod::ChoiceValue::Fraction(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Range {
+                    default: spa::utils::Fraction {
+                        num: max_fps,
+                        denom: 1,
+                    },
+                    min: spa::utils::Fraction { num: 1, denom: 1 },
+                    max: spa::utils::Fraction {
+                        num: max_fps,
+                        denom: 1,
+                    },
                 },
             ))),
         });

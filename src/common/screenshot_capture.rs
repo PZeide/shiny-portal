@@ -61,7 +61,7 @@ pub fn capture_target(
 ) -> anyhow::Result<RgbaImage> {
     let probe = capture.probe(target, paint_cursors)?;
     let format = choose_readable_shm_format(&probe.shm_formats).ok_or_else(|| {
-        anyhow::anyhow!("compositor advertised no readable SHM screenshot format")
+        anyhow::anyhow!("compositor advertised no readable shm screenshot format")
     })?;
 
     let fd = rustix::fs::memfd_create(
@@ -74,7 +74,7 @@ pub fn capture_target(
     let buffer = capture.create_shm_buffer(target, Some(format.format), fd.as_fd())?;
     let actual_format = buffer
         .shm_format()
-        .ok_or_else(|| anyhow::anyhow!("screenshot capture created a non-SHM buffer"))?;
+        .ok_or_else(|| anyhow::anyhow!("screenshot capture created a non-shm buffer"))?;
 
     if actual_format.byte_size() > format.byte_size() {
         anyhow::bail!("screenshot buffer constraints changed during allocation");
@@ -176,7 +176,7 @@ fn shm_to_rgba(bytes: &[u8], format: ShmFormat) -> anyhow::Result<RgbaImage> {
             let pixel = u32::from_ne_bytes(
                 bytes[source_offset..source_offset + 4]
                     .try_into()
-                    .expect("four-byte SHM pixel"),
+                    .expect("four-byte shm pixel"),
             );
             let rgba = unpack_shm_pixel(pixel, format.format)?;
             image.pixels[target_offset..target_offset + 4].copy_from_slice(&rgba);
@@ -226,7 +226,7 @@ fn unpack_shm_pixel(pixel: u32, format: wl_shm::Format) -> anyhow::Result<[u8; 4
             ten_to_eight((pixel >> 20) & 0x3ff),
             255,
         ],
-        _ => anyhow::bail!("unsupported screenshot SHM format {format:?}"),
+        _ => anyhow::bail!("unsupported screenshot shm format {format:?}"),
     };
     Ok(result)
 }
@@ -262,7 +262,7 @@ fn path_to_file_uri(path: &Path) -> String {
             }
             _ => {
                 use std::fmt::Write;
-                write!(uri, "%{byte:02X}").expect("writing to String cannot fail");
+                write!(uri, "%{byte:02X}").expect("writing failed");
             }
         }
     }

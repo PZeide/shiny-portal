@@ -373,9 +373,7 @@ impl ScreenCastPortal {
         let cast_thread =
             ScreencastThread::start_cast(overlay_cursor, target, capture, self.config)
                 .await
-                .map_err(|err| {
-                    zbus::Error::Failure(format!("cannot start PipeWire stream: {err}"))
-                })?;
+                .map_err(|err| zbus::Error::Failure(format!("cannot start pw stream: {err}")))?;
 
         let node_id = cast_thread.node_id();
         let pipewire_serial = cast_thread.pipewire_serial();

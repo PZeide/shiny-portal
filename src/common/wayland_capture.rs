@@ -348,7 +348,7 @@ impl DirectCapture {
         }
 
         self.outputs = state.outputs;
-        info!("discovered {} Wayland outputs", self.outputs.len());
+        info!("discovered {} wayland outputs", self.outputs.len());
         for output in &self.outputs {
             debug!(
                 "output: name={}, description={}, size={}x{}",
@@ -371,7 +371,7 @@ impl DirectCapture {
         event_queue.roundtrip(&mut state)?;
 
         self.toplevels = state.toplevels;
-        info!("discovered {} Wayland toplevels", self.toplevels.len());
+        info!("discovered {} wayland toplevels", self.toplevels.len());
 
         Ok(())
     }
@@ -413,7 +413,7 @@ impl DirectCapture {
     ) -> anyhow::Result<DirectCaptureBuffer> {
         let probe = self.probe(target, false)?;
         let Some(gbm) = self.gbm.as_ref() else {
-            anyhow::bail!("compositor did not provide a DMA-BUF device");
+            anyhow::bail!("compositor did not provide a dma-buf device");
         };
 
         let modifier = preferred_modifier
@@ -423,7 +423,7 @@ impl DirectCapture {
                     .iter()
                     .find_map(|format| format.modifiers.first().copied())
             })
-            .ok_or_else(|| anyhow::anyhow!("no DMA-BUF modifiers were advertised"))?;
+            .ok_or_else(|| anyhow::anyhow!("no dma-buf modifiers were advertised"))?;
 
         let mut candidates = Vec::new();
         if let Some(fourcc) = preferred_fourcc {
@@ -450,7 +450,7 @@ impl DirectCapture {
                 Ok(buffer) => return Ok(buffer),
                 Err(err) => {
                     warn!(
-                        "failed to create DMA-BUF buffer for fourcc=0x{:08x}, \
+                        "failed to create dma-buf buffer for fourcc=0x{:08x}, \
                          size={}x{}, modifier=0x{:016x}: {err}",
                         format.fourcc, format.size.width, format.size.height, modifier
                     );
@@ -459,7 +459,24 @@ impl DirectCapture {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no DMA-BUF formats were advertised")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no dma-buf formats were advertised")))
+    }
+
+    pub fn dmabuf_plane_count(&self, fourcc: u32, modifier: u64) -> anyhow::Result<u32> {
+        if modifier == DRM_FORMAT_MOD_INVALID {
+            return Ok(1);
+        }
+
+        let Some(gbm) = self.gbm.as_ref() else {
+            anyhow::bail!("compositor did not provide a dma-buf device");
+        };
+        let format = gbm::Format::try_from(fourcc)?;
+        gbm.format_modifier_plane_count(format, Modifier::from(modifier))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gbm could not determine plane count for fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}"
+                )
+            })
     }
 
     pub fn create_shm_buffer(
@@ -474,7 +491,7 @@ impl DirectCapture {
 
         let qh = event_queue.handle();
         let format = choose_shm_format(&state.shm_formats, preferred_format)
-            .ok_or_else(|| anyhow::anyhow!("no compatible SHM format was advertised"))?;
+            .ok_or_else(|| anyhow::anyhow!("no compatible shm format was advertised"))?;
 
         let shm = self.globals.bind::<WlShm, _, _>(&qh, 1..=1, ())?;
         let pool = shm.create_pool(fd, format.byte_size().try_into()?, &qh, ());
@@ -652,14 +669,14 @@ impl DirectCapture {
         let actual_modifier: u64 = bo.modifier().into();
         if actual_modifier != modifier {
             anyhow::bail!(
-                "GBM returned modifier 0x{actual_modifier:016x}, expected 0x{modifier:016x}"
+                "gbm returned modifier 0x{actual_modifier:016x}, expected 0x{modifier:016x}"
             );
         }
 
         let actual_fourcc = bo.format() as u32;
         if actual_fourcc != format.fourcc {
             anyhow::bail!(
-                "GBM returned fourcc=0x{:08x}, expected 0x{:08x}",
+                "gbm returned fourcc=0x{:08x}, expected 0x{:08x}",
                 actual_fourcc,
                 format.fourcc
             );
@@ -694,7 +711,7 @@ impl DirectCapture {
                     BufferCreateState::Created(buffer) => buffer,
                     BufferCreateState::Failed => {
                         anyhow::bail!(
-                            "compositor rejected DMA-BUF buffer for fourcc=0x{:08x}, \
+                            "compositor rejected dma-buf buffer for fourcc=0x{:08x}, \
                              size={}x{}, modifier=0x{:016x}",
                             format.fourcc,
                             format.size.width,
@@ -711,7 +728,7 @@ impl DirectCapture {
         drop(plane_fds);
 
         info!(
-            "created direct DMA-BUF wl_buffer: fourcc=0x{:08x}, size={}x{}, planes={}, modifier=0x{:016x}",
+            "created direct dma-buf wl_buffer: fourcc=0x{:08x}, size={}x{}, planes={}, modifier=0x{:016x}",
             format.fourcc, format.size.width, format.size.height, plane_count, modifier
         );
 
@@ -982,18 +999,18 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
                 }
 
                 let Ok(bytes) = <[u8; 8]>::try_from(device.as_slice()) else {
-                    warn!("compositor sent malformed DMA-BUF device identifier");
+                    warn!("compositor sent malformed dma-buf device identifier");
                     return;
                 };
 
                 let dev_id = u64::from_le_bytes(bytes);
                 let Ok(node) = DrmNode::from_dev_id(dev_id) else {
-                    warn!("failed to resolve DRM node for dev id {dev_id}");
+                    warn!("failed to resolve drm node for dev id {dev_id}");
                     return;
                 };
 
                 let Some(path) = node.dev_path() else {
-                    warn!("DRM node for dev id {dev_id} has no path");
+                    warn!("drm node for dev id {dev_id} has no path");
                     return;
                 };
 
@@ -1001,10 +1018,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
                     GbmDevice::new(card).map_err(|err| std::io::Error::other(err.to_string()))
                 }) {
                     Ok(gbm) => {
-                        info!("using compositor DMA-BUF device {}", path.display());
+                        info!("using compositor dma-buf device {}", path.display());
                         state.gbm = Some(gbm);
                     }
-                    Err(err) => warn!("failed to open GBM device {}: {err}", path.display()),
+                    Err(err) => warn!("failed to open gbm device {}: {err}", path.display()),
                 }
             }
             ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
@@ -1013,7 +1030,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
                     .filter_map(|bytes| match bytes.try_into() {
                         Ok(bytes) => Some(u64::from_ne_bytes(bytes)),
                         Err(err) => {
-                            warn!("failed to parse DMA-BUF modifier bytes: {err}");
+                            warn!("failed to parse dma-buf modifier bytes: {err}");
                             None
                         }
                     })
