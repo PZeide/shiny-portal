@@ -15,6 +15,7 @@ use crate::{
         shell_ipc::{SelectionResult, SharePickerOptions, SharePickerResult, ShinyShell},
         wayland_capture::{CaptureTarget, DirectCapture},
     },
+    config::Config,
     portals::{PortalResponse, request::Request, session::Session},
 };
 
@@ -79,6 +80,8 @@ struct StreamProperties {
     size: (i32, i32),
     source_type: SourceType,
     mapping_id: Option<String>,
+    #[zvariant(rename = "pipewire-serial")]
+    pipewire_serial: u64,
 }
 
 #[derive(Serialize, Debug, Type)]
@@ -96,7 +99,7 @@ struct StartResult {
 #[serde(tag = "type", rename_all = "camelCase")]
 enum RestoreTokenPayload {
     Monitor { monitor: String },
-    Window { stable_id: String },
+    Window { class: String, title: String },
 }
 
 #[derive(Debug)]
@@ -124,9 +127,18 @@ struct ScreenCastSession {
     cast_thread: Option<ScreencastThread>,
 }
 
-#[derive(Default)]
 pub struct ScreenCastPortal {
     shell: ShinyShell,
+    config: Config,
+}
+
+impl ScreenCastPortal {
+    pub fn new(config: Config) -> Self {
+        Self {
+            shell: ShinyShell,
+            config,
+        }
+    }
 }
 
 #[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -143,7 +155,7 @@ impl ScreenCastPortal {
 
     #[zbus(property)]
     async fn version(&self) -> u32 {
-        5
+        6
     }
 
     async fn create_session(
@@ -173,7 +185,7 @@ impl ScreenCastPortal {
                 async move {
                     debug!("removing screencast session {session_handle:?}");
                     if let Some(thread) = thread {
-                        debug!("stopping active PipeWire stream for {session_handle:?}");
+                        debug!("stopping active pw stream for {session_handle:?}");
                         thread.stop();
                     }
                 }
@@ -282,9 +294,7 @@ impl ScreenCastPortal {
                 let share_result = match self
                     .shell
                     .share_picker(SharePickerOptions {
-                        allow_monitor: Some(
-                            options.source_types.contains(SourceType::Monitor),
-                        ),
+                        allow_monitor: Some(options.source_types.contains(SourceType::Monitor)),
                         allow_window: Some(options.source_types.contains(SourceType::Window)),
                         allow_custom_region: Some(false),
                         allow_restore_token_default: restore_token_default(options),
@@ -328,6 +338,8 @@ impl ScreenCastPortal {
                     }
                     SelectionResult::Window {
                         stable_id,
+                        clazz,
+                        title,
                         allow_restore_token,
                         ..
                     } => {
@@ -344,7 +356,10 @@ impl ScreenCastPortal {
                         (
                             CaptureTarget::Toplevel(window.handle.clone()),
                             SourceType::Window,
-                            RestoreTokenPayload::Window { stable_id },
+                            RestoreTokenPayload::Window {
+                                class: clazz,
+                                title,
+                            },
                             allow_restore_token,
                         )
                     }
@@ -355,23 +370,29 @@ impl ScreenCastPortal {
                 }
             };
 
-        let cast_thread = ScreencastThread::start_cast(overlay_cursor, target, capture)
-            .await
-            .map_err(|err| zbus::Error::Failure(format!("cannot start PipeWire stream: {err}")))?;
+        let cast_thread =
+            ScreencastThread::start_cast(overlay_cursor, target, capture, self.config)
+                .await
+                .map_err(|err| {
+                    zbus::Error::Failure(format!("cannot start PipeWire stream: {err}"))
+                })?;
 
         let node_id = cast_thread.node_id();
+        let pipewire_serial = cast_thread.pipewire_serial();
         let size = cast_thread.size();
+
         if let Some(previous) = session.inner.cast_thread.replace(cast_thread) {
             previous.stop();
         }
 
-        info!("screencast started with PipeWire node id {node_id}");
+        info!("screencast started with pw node id {node_id}, serial {pipewire_serial}");
 
         let restore_data = if should_return_restore_token(persist_mode, allow_restore_token) {
             restore_data_from_payload(restore_payload)
         } else {
             None
         };
+
         let persist_mode = restore_data.as_ref().map(|_| persist_mode);
 
         Ok(PortalResponse::Success(StartResult {
@@ -382,6 +403,7 @@ impl ScreenCastPortal {
                     size: (size.width as i32, size.height as i32),
                     source_type,
                     mapping_id: None,
+                    pipewire_serial,
                 },
             )],
             persist_mode,
@@ -456,7 +478,11 @@ fn resolve_restore_payload(
                 return None;
             }
 
-            let Some(output) = capture.outputs().iter().find(|output| output.name == monitor) else {
+            let Some(output) = capture
+                .outputs()
+                .iter()
+                .find(|output| output.name == monitor)
+            else {
                 warn!("restored monitor {monitor} is no longer available");
                 return None;
             };
@@ -468,27 +494,78 @@ fn resolve_restore_payload(
                 true,
             ))
         }
-        RestoreTokenPayload::Window { stable_id } => {
+        RestoreTokenPayload::Window { class, title } => {
             if !source_types.contains(SourceType::Window) {
                 warn!("ignoring restored window because window capture was not requested");
                 return None;
             }
 
-            let Some(window) = capture
+            if class.is_empty() {
+                warn!("restored window token has no class");
+                return None;
+            }
+
+            let class_matches: Vec<_> = capture
                 .toplevels()
                 .iter()
-                .find(|window| window.identifier == stable_id)
-            else {
-                warn!("restored window {stable_id} is no longer available");
-                return None;
+                .filter(|window| window.app_id == class)
+                .collect();
+
+            let window = match class_matches.as_slice() {
+                [] => {
+                    warn!("no current window matches restored class {class}");
+                    return None;
+                }
+                [window] => *window,
+                matches => {
+                    let title_matches: Vec<_> = matches
+                        .iter()
+                        .copied()
+                        .filter(|window| window.title == title)
+                        .collect();
+
+                    match title_matches.as_slice() {
+                        [window] => *window,
+                        [] => {
+                            warn!(
+                                "{} windows match restored class {class}, but none match title {title:?}",
+                                matches.len()
+                            );
+                            return None;
+                        }
+                        matches => {
+                            warn!(
+                                "{} windows match restored class {class} and title {title:?}; prompting instead",
+                                matches.len()
+                            );
+
+                            return None;
+                        }
+                    }
+                }
             };
 
-            Some((
-                CaptureTarget::Toplevel(window.handle.clone()),
-                SourceType::Window,
-                RestoreTokenPayload::Window { stable_id },
-                true,
-            ))
+            info!(
+                "restored window using class={} title={:?}",
+                window.app_id, window.title
+            );
+
+            Some(restored_window(window, true))
         }
     }
+}
+
+fn restored_window(
+    window: &crate::common::wayland_capture::ToplevelInfo,
+    allow_restore_token: bool,
+) -> (CaptureTarget, SourceType, RestoreTokenPayload, bool) {
+    (
+        CaptureTarget::Toplevel(window.handle.clone()),
+        SourceType::Window,
+        RestoreTokenPayload::Window {
+            class: window.app_id.clone(),
+            title: window.title.clone(),
+        },
+        allow_restore_token,
+    )
 }

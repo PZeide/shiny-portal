@@ -248,8 +248,9 @@ pub enum SelectionResult {
     #[serde(rename_all = "camelCase")]
     Window {
         allow_restore_token: bool,
-        window_address: String,
         stable_id: String,
+        clazz: String,
+        title: String,
     },
     #[serde(rename_all = "camelCase")]
     Custom {

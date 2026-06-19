@@ -5,11 +5,16 @@ use zbus::{Connection, conn::Builder};
 
 use crate::{
     cli::Cli,
-    portals::{PORTAL_DBUS_NAME, PORTAL_DBUS_PATH, screen_cast::ScreenCastPortal},
+    config::Config,
+    portals::{
+        PORTAL_DBUS_NAME, PORTAL_DBUS_PATH, screen_cast::ScreenCastPortal,
+        screenshot::ScreenshotPortal,
+    },
 };
 
 mod cli;
 mod common;
+mod config;
 mod portals;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -21,7 +26,21 @@ async fn main() {
 
     fmt().with_env_filter(filter).init();
 
-    let portal_connection = match start_portal().await {
+    let (config, config_path) = match Config::load_or_create() {
+        Ok(config) => config,
+        Err(err) => {
+            error!("failed to load configuration: {err}");
+            return;
+        }
+    };
+    info!(
+        "loaded configuration from {}: max_fps={}, allow_shm={}",
+        config_path.display(),
+        config.max_fps,
+        config.allow_shm
+    );
+
+    let portal_connection = match start_portal(config).await {
         Ok(conn) => conn,
         Err(err) => {
             error!("failed to start portal: {err}");
@@ -39,10 +58,11 @@ async fn main() {
     portal_connection.graceful_shutdown().await;
 }
 
-async fn start_portal() -> anyhow::Result<Connection> {
+async fn start_portal(config: Config) -> anyhow::Result<Connection> {
     Ok(Builder::session()?
         .name(PORTAL_DBUS_NAME)?
-        .serve_at(PORTAL_DBUS_PATH, ScreenCastPortal::default())?
+        .serve_at(PORTAL_DBUS_PATH, ScreenCastPortal::new(config))?
+        .serve_at(PORTAL_DBUS_PATH, ScreenshotPortal::default())?
         .build()
         .await?)
 }

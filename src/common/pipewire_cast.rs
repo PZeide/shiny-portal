@@ -1,7 +1,10 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::c_void,
     io,
     os::fd::{AsFd, IntoRawFd},
+    rc::Rc,
     slice,
 };
 
@@ -17,18 +20,23 @@ use pipewire::{
         sys as spa_sys,
     },
     stream::StreamState,
+    types::ObjectType,
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 use wayland_client::protocol::wl_shm;
 
-use crate::common::wayland_capture::{
-    CaptureError, CaptureProbe, CaptureTarget, DamageRect, DamageSet, DirectCapture,
-    DirectCaptureBuffer, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, DmabufFormat, Size, fourcc,
+use crate::{
+    common::wayland_capture::{
+        CaptureError, CaptureProbe, CaptureTarget, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR,
+        DamageRect, DamageSet, DirectCapture, DirectCaptureBuffer, DmabufFormat, Size, fourcc,
+    },
+    config::Config,
 };
 
 pub struct ScreencastThread {
     node_id: u32,
+    pipewire_serial: u64,
     size: Size,
     thread_stop_tx: pipewire::channel::Sender<()>,
 }
@@ -38,33 +46,47 @@ impl ScreencastThread {
         overlay_cursor: bool,
         target: CaptureTarget,
         capture: DirectCapture,
+        config: Config,
     ) -> anyhow::Result<Self> {
         let (node_id_tx, node_id_rx) = oneshot::channel();
         let (thread_stop_tx, thread_stop_rx) = pipewire::channel::channel::<()>();
 
-        std::thread::spawn(move || {
-            match start_stream(capture, overlay_cursor, target) {
-                Ok((main_loop, listener, _stream, context, node_id_ready)) => {
+        std::thread::spawn(
+            move || match start_stream(capture, overlay_cursor, target, config) {
+                Ok((
+                    main_loop,
+                    listener,
+                    _stream,
+                    _registry,
+                    registry_listener,
+                    context,
+                    node_id_ready,
+                )) => {
                     let _ = node_id_tx.send(Ok(node_id_ready));
                     let weak_loop = main_loop.downgrade();
+
                     let _receiver = thread_stop_rx.attach(main_loop.loop_(), move |()| {
                         if let Some(main_loop) = weak_loop.upgrade() {
                             main_loop.quit();
                         }
                     });
+
                     main_loop.run();
                     drop(listener);
+                    drop(registry_listener);
                     drop(context);
                 }
                 Err(err) => {
                     let _ = node_id_tx.send(Err(err));
                 }
-            }
-        });
+            },
+        );
 
-        let (node_id, size) = node_id_rx.await??.await??;
+        let (node_id, pipewire_serial, size) = node_id_rx.await??.await??;
+
         Ok(Self {
             node_id,
+            pipewire_serial,
             size,
             thread_stop_tx,
         })
@@ -72,6 +94,10 @@ impl ScreencastThread {
 
     pub fn node_id(&self) -> u32 {
         self.node_id
+    }
+
+    pub fn pipewire_serial(&self) -> u64 {
+        self.pipewire_serial
     }
 
     pub fn size(&self) -> Size {
@@ -156,6 +182,7 @@ struct StreamingData {
     chosen_format: Option<VideoFormat>,
     chosen_modifier: Option<u64>,
     allow_shm_fallback: bool,
+    max_fps: u32,
     buffers: Vec<*mut pipewire::sys::pw_buffer>,
 }
 
@@ -179,7 +206,6 @@ impl StreamingData {
         }
 
         let stream_buffer = unsafe { &mut *(user_data as *mut StreamBuffer) };
-
         match self.capture.capture_into_buffer(
             &self.target,
             self.overlay_cursor,
@@ -202,6 +228,7 @@ impl StreamingData {
                                     self.formats.size.height,
                                     &self.formats.spa_formats,
                                     &self.formats.modifiers,
+                                    self.max_fps,
                                 );
                                 let buffers = buffer_param(
                                     self.formats.size.width,
@@ -245,10 +272,11 @@ impl StreamingData {
             let selected_modifier = self
                 .chosen_modifier
                 .or_else(|| self.formats.modifiers.first().copied());
-            let capture_buffer = match self
-                .capture
-                .create_dmabuf_buffer(&self.target, selected_fourcc, selected_modifier)
-            {
+            let capture_buffer = match self.capture.create_dmabuf_buffer(
+                &self.target,
+                selected_fourcc,
+                selected_modifier,
+            ) {
                 Ok(buffer) => buffer,
                 Err(err) => {
                     error!("direct DMA-BUF capture buffer allocation failed: {err}");
@@ -272,11 +300,7 @@ impl StreamingData {
 
             info!(
                 "allocating PipeWire DMA-BUF buffer: fourcc=0x{:08x}, size={}x{}, planes={}, modifier=0x{:016x}",
-                format.fourcc,
-                format.size.width,
-                format.size.height,
-                plane_count,
-                modifier
+                format.fourcc, format.size.width, format.size.height, plane_count, modifier
             );
 
             for (index, data) in datas.iter_mut().take(plane_count).enumerate() {
@@ -340,16 +364,17 @@ impl StreamingData {
             return;
         }
         let preferred_shm_format = self.chosen_format.and_then(spa_to_shm_format);
-        let capture_buffer = match self
-            .capture
-            .create_shm_buffer(&self.target, preferred_shm_format, fd.as_fd())
-        {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                error!("direct SHM capture buffer allocation failed: {err}");
-                return;
-            }
-        };
+        let capture_buffer =
+            match self
+                .capture
+                .create_shm_buffer(&self.target, preferred_shm_format, fd.as_fd())
+            {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    error!("direct SHM capture buffer allocation failed: {err}");
+                    return;
+                }
+            };
 
         data.type_ = spa_sys::SPA_DATA_MemFd;
         data.flags = 0;
@@ -448,7 +473,10 @@ impl StreamingData {
             let stream_buffer = unsafe { &mut *(user_data as *mut StreamBuffer) };
             stream_buffer.pending_damage = DamageSet::full();
         }
-        debug!("reset pending damage to full for {} PipeWire buffers", self.buffers.len());
+        debug!(
+            "reset pending damage to full for {} PipeWire buffers",
+            self.buffers.len()
+        );
     }
 
     fn param_changed(&mut self, id: u32, pod: Option<&Pod>) {
@@ -465,12 +493,18 @@ impl StreamingData {
             Ok(_) => {
                 self.chosen_format = Some(info.format());
                 self.chosen_modifier = Some(info.modifier());
+                let framerate = info.framerate();
+                let max_framerate = info.max_framerate();
                 info!(
-                    "PipeWire selected format={:?}, drm_fourcc={:?}, shm={:?}, modifier=0x{:016x}",
+                    "PipeWire selected format={:?}, drm_fourcc={:?}, shm={:?}, modifier=0x{:016x}, framerate={}/{}, max_framerate={}/{}",
                     info.format(),
                     spa_to_drm_fourcc(info.format()).map(|fourcc| format!("0x{fourcc:08x}")),
                     spa_to_shm_format(info.format()),
-                    info.modifier()
+                    info.modifier(),
+                    framerate.num,
+                    framerate.denom,
+                    max_framerate.num,
+                    max_framerate.denom
                 );
             }
             Err(err) => error!("could not parse PipeWire format: {err}"),
@@ -482,21 +516,61 @@ type PipewireStreamResult = (
     pipewire::main_loop::MainLoopRc,
     pipewire::stream::StreamListener<StreamingData>,
     pipewire::stream::StreamRc,
+    pipewire::registry::RegistryRc,
+    pipewire::registry::Listener,
     pipewire::context::ContextRc,
-    oneshot::Receiver<anyhow::Result<(u32, Size)>>,
+    oneshot::Receiver<anyhow::Result<(u32, u64, Size)>>,
 );
+
+struct StreamReadyState {
+    sender: Option<oneshot::Sender<anyhow::Result<(u32, u64, Size)>>>,
+    node_id: Option<u32>,
+    serials: HashMap<u32, u64>,
+    size: Size,
+}
+
+impl StreamReadyState {
+    fn set_node(&mut self, node_id: u32, serial: Option<u64>) {
+        self.node_id = Some(node_id);
+        if let Some(serial) = serial {
+            self.serials.insert(node_id, serial);
+        }
+        self.send_if_ready();
+    }
+
+    fn set_serial(&mut self, node_id: u32, serial: u64) {
+        self.serials.insert(node_id, serial);
+        self.send_if_ready();
+    }
+
+    fn send_if_ready(&mut self) {
+        let Some(node_id) = self.node_id else {
+            return;
+        };
+        let Some(serial) = self.serials.get(&node_id).copied() else {
+            return;
+        };
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+
+        let _ = sender.send(Ok((node_id, serial, self.size)));
+    }
+}
 
 fn start_stream(
     mut capture: DirectCapture,
     overlay_cursor: bool,
     target: CaptureTarget,
+    config: Config,
 ) -> anyhow::Result<PipewireStreamResult> {
     let main_loop = pipewire::main_loop::MainLoopRc::new(None)?;
     let context = pipewire::context::ContextRc::new(&main_loop, None)?;
     let core = context.connect_rc(None)?;
+    let registry = core.get_registry_rc()?;
 
     let stream = pipewire::stream::StreamRc::new(
-        core,
+        core.clone(),
         "xdg-desktop-portal-shiny",
         pipewire::properties::properties! {
             "media.class" => "Video/Source",
@@ -505,9 +579,14 @@ fn start_stream(
         },
     )?;
 
-    let allow_shm_fallback = std::env::var_os("SHINY_PORTAL_ALLOW_SHM").is_some();
+    let allow_shm_fallback = config.allow_shm;
     if allow_shm_fallback {
-        warn!("SHINY_PORTAL_ALLOW_SHM is set; SHM fallback is enabled");
+        warn!("SHM fallback is enabled by configuration");
+    }
+    if config.max_fps == 0 {
+        info!("screencast capture rate is unlimited");
+    } else {
+        info!("limiting screencast capture rate to {} FPS", config.max_fps);
     }
 
     let probe = capture.probe(&target, overlay_cursor)?;
@@ -520,9 +599,37 @@ fn start_stream(
     );
 
     let (node_id_tx, node_id_rx) = oneshot::channel();
-    let mut node_id_tx = Some(node_id_tx);
     let stream_size = formats.size;
+    let ready_state = Rc::new(RefCell::new(StreamReadyState {
+        sender: Some(node_id_tx),
+        node_id: None,
+        serials: HashMap::new(),
+        size: stream_size,
+    }));
 
+    let registry_ready_state = ready_state.clone();
+    let registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.type_ != ObjectType::Node {
+                return;
+            }
+            let Some(serial) = global
+                .props
+                .as_ref()
+                .and_then(|props| props.get(&pipewire::keys::OBJECT_SERIAL))
+                .and_then(|serial| serial.parse::<u64>().ok())
+            else {
+                return;
+            };
+
+            registry_ready_state
+                .borrow_mut()
+                .set_serial(global.id, serial);
+        })
+        .register();
+
+    let stream_ready_state = ready_state.clone();
     let listener = stream
         .add_local_listener_with_user_data(StreamingData {
             capture,
@@ -532,15 +639,20 @@ fn start_stream(
             chosen_format: None,
             chosen_modifier: None,
             allow_shm_fallback,
+            max_fps: config.max_fps,
             buffers: Vec::new(),
         })
         .state_changed(move |stream, _, old, new| {
             info!("PipeWire stream state changed: {old:?} -> {new:?}");
             match new {
                 StreamState::Paused => {
-                    if let Some(tx) = node_id_tx.take() {
-                        let _ = tx.send(Ok((stream.node_id(), stream_size)));
-                    }
+                    let serial = stream
+                        .properties()
+                        .get(&pipewire::keys::OBJECT_SERIAL)
+                        .and_then(|serial| serial.parse::<u64>().ok());
+                    stream_ready_state
+                        .borrow_mut()
+                        .set_node(stream.node_id(), serial);
                 }
                 StreamState::Error(err) => error!("PipeWire stream error: {err}"),
                 _ => {}
@@ -565,6 +677,7 @@ fn start_stream(
         formats.size.height,
         &formats.spa_formats,
         &formats.modifiers,
+        config.max_fps,
     );
     let buffers = buffer_param(
         formats.size.width,
@@ -584,7 +697,15 @@ fn start_stream(
         params,
     )?;
 
-    Ok((main_loop, listener, stream, context, node_id_rx))
+    Ok((
+        main_loop,
+        listener,
+        stream,
+        registry,
+        registry_listener,
+        context,
+        node_id_rx,
+    ))
 }
 
 fn log_probe(probe: &CaptureProbe) {
@@ -692,6 +813,7 @@ fn format_param(
     height: u32,
     available_video_formats: &[VideoFormat],
     dmabuf_modifiers: &[u64],
+    max_fps: u32,
 ) -> Vec<u8> {
     let mut obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
@@ -706,17 +828,35 @@ fn format_param(
             spa::utils::Rectangle { width, height },
             spa::utils::Rectangle { width, height },
             spa::utils::Rectangle { width, height }
-        ),
-        spa::pod::property!(
-            FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            spa::utils::Fraction { num: 60, denom: 1 },
-            spa::utils::Fraction { num: 1, denom: 1 },
-            spa::utils::Fraction { num: 60, denom: 1 }
         )
     );
+
+    obj.properties.push(pod::Property {
+        key: FormatProperties::VideoFramerate.as_raw(),
+        flags: pod::PropertyFlags::empty(),
+        value: pod::Value::Fraction(spa::utils::Fraction { num: 0, denom: 1 }),
+    });
+
+    if max_fps > 0 {
+        obj.properties.push(pod::Property {
+            key: FormatProperties::VideoMaxFramerate.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Choice(pod::ChoiceValue::Fraction(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Range {
+                    default: spa::utils::Fraction {
+                        num: max_fps,
+                        denom: 1,
+                    },
+                    min: spa::utils::Fraction { num: 1, denom: 1 },
+                    max: spa::utils::Fraction {
+                        num: max_fps,
+                        denom: 1,
+                    },
+                },
+            ))),
+        });
+    }
 
     obj.properties.push(pod::Property {
         key: FormatProperties::VideoFormat.as_raw(),

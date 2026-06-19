@@ -61,6 +61,7 @@ pub struct OutputInfo {
     pub output: WlOutput,
     pub name: String,
     pub description: String,
+    pub position: (i32, i32),
     pub size: Size,
 }
 
@@ -378,7 +379,11 @@ impl DirectCapture {
         target: &CaptureTarget,
         paint_cursors: bool,
     ) -> anyhow::Result<CaptureProbe> {
-        let (state, _event_queue, _frame) = self.create_frame(target, paint_cursors, true)?;
+        let (state, _event_queue, capture_frame) =
+            self.create_frame(target, paint_cursors, true)?;
+        capture_frame.destroy();
+        self.conn.flush()?;
+
         if self.gbm.is_none() {
             self.gbm = state.gbm;
         }
@@ -459,7 +464,10 @@ impl DirectCapture {
         preferred_format: Option<wl_shm::Format>,
         fd: BorrowedFd<'_>,
     ) -> anyhow::Result<DirectCaptureBuffer> {
-        let (state, event_queue, _frame) = self.create_frame(target, false, false)?;
+        let (state, event_queue, capture_frame) = self.create_frame(target, false, false)?;
+        capture_frame.destroy();
+        self.conn.flush()?;
+
         let qh = event_queue.handle();
         let format = choose_shm_format(&state.shm_formats, preferred_format)
             .ok_or_else(|| anyhow::anyhow!("no compatible SHM format was advertised"))?;
@@ -490,8 +498,9 @@ impl DirectCapture {
         buffer: &DirectCaptureBuffer,
         damage: &DamageSet,
     ) -> Result<Vec<DamageRect>, CaptureError> {
-        let (mut state, mut event_queue, frame) =
+        let (mut state, mut event_queue, capture_frame) =
             self.create_frame(target, paint_cursors, false)?;
+        let frame = &capture_frame.frame;
 
         frame.attach_buffer(buffer.wl_buffer());
         let damage_rects = damage.rects_for_frame(buffer.size());
@@ -513,7 +522,7 @@ impl DirectCapture {
 
         loop {
             if let Some(frame_state) = state.frame_state {
-                return match frame_state {
+                let result = match frame_state {
                     FrameState::Ready => Ok(state.damage_rects),
                     FrameState::Failed(WEnum::Value(FailureReason::BufferConstraints)) => {
                         Err(CaptureError::BufferConstraints)
@@ -523,11 +532,18 @@ impl DirectCapture {
                     }
                     FrameState::Failed(_) => Err(CaptureError::Failed),
                 };
+                capture_frame.destroy();
+                self.conn
+                    .flush()
+                    .map_err(|err| CaptureError::Anyhow(err.into()))?;
+                return result;
             }
 
-            event_queue
-                .blocking_dispatch(&mut state)
-                .map_err(|err| CaptureError::Anyhow(err.into()))?;
+            if let Err(err) = event_queue.blocking_dispatch(&mut state) {
+                capture_frame.destroy();
+                let _ = self.conn.flush();
+                return Err(CaptureError::Anyhow(err.into()));
+            }
         }
     }
 
@@ -539,7 +555,7 @@ impl DirectCapture {
     ) -> anyhow::Result<(
         CaptureState,
         EventQueue<CaptureState>,
-        ExtImageCopyCaptureFrameV1,
+        CaptureFrame,
     )> {
         let mut state = CaptureState::new(find_gbm);
         let mut event_queue = self.conn.new_event_queue::<CaptureState>();
@@ -553,7 +569,9 @@ impl DirectCapture {
                 let source_manager = self
                     .globals
                     .bind::<ExtOutputImageCaptureSourceManagerV1, _, _>(&qh, 1..=1, ())?;
-                source_manager.create_source(output, &qh, ())
+                let source = source_manager.create_source(output, &qh, ());
+                source_manager.destroy();
+                source
             }
             CaptureTarget::Toplevel(toplevel) => {
                 let source_manager = self
@@ -563,7 +581,9 @@ impl DirectCapture {
                         1..=1,
                         (),
                     )?;
-                source_manager.create_source(toplevel, &qh, ())
+                let source = source_manager.create_source(toplevel, &qh, ());
+                source_manager.destroy();
+                source
             }
         };
 
@@ -573,13 +593,24 @@ impl DirectCapture {
             Options::empty()
         };
         let session = manager.create_session(&source, options, &qh, ());
+        source.destroy();
+        manager.destroy();
         let frame = session.create_frame(&qh, ());
 
         while !state.session_done {
-            event_queue.blocking_dispatch(&mut state)?;
+            if let Err(err) = event_queue.blocking_dispatch(&mut state) {
+                frame.destroy();
+                session.destroy();
+                let _ = self.conn.flush();
+                return Err(err.into());
+            }
         }
 
-        Ok((state, event_queue, frame))
+        Ok((
+            state,
+            event_queue,
+            CaptureFrame { frame, session },
+        ))
     }
 
     fn create_dmabuf_buffer_for_format(
@@ -690,6 +721,18 @@ impl DirectCapture {
     }
 }
 
+struct CaptureFrame {
+    frame: ExtImageCopyCaptureFrameV1,
+    session: ExtImageCopyCaptureSessionV1,
+}
+
+impl CaptureFrame {
+    fn destroy(self) {
+        self.frame.destroy();
+        self.session.destroy();
+    }
+}
+
 pub enum DirectCaptureBuffer {
     Dmabuf {
         buffer: WlBuffer,
@@ -738,6 +781,13 @@ impl DirectCaptureBuffer {
             Self::Shm { .. } => None,
         }
     }
+
+    pub fn shm_format(&self) -> Option<ShmFormat> {
+        match self {
+            Self::Dmabuf { .. } => None,
+            Self::Shm { format, .. } => Some(*format),
+        }
+    }
 }
 
 impl Drop for DirectCaptureBuffer {
@@ -779,6 +829,7 @@ impl Dispatch<WlRegistry, ()> for DiscoveryState {
                 output,
                 name: String::new(),
                 description: String::new(),
+                position: (0, 0),
                 size: Size::default(),
             });
         }
@@ -830,6 +881,9 @@ impl Dispatch<ZxdgOutputV1, usize> for DiscoveryState {
         };
 
         match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                info.position = (x, y);
+            }
             zxdg_output_v1::Event::LogicalSize { width, height } if width > 0 && height > 0 => {
                 info.size = Size {
                     width: width as u32,

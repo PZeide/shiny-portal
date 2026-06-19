@@ -5,6 +5,7 @@ use zvariant::{OwnedValue, Type, Value};
 
 pub mod request;
 pub mod screen_cast;
+pub mod screenshot;
 pub mod session;
 
 pub static PORTAL_DBUS_NAME: &str = "org.freedesktop.impl.portal.desktop.shiny";
