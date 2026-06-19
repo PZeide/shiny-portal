@@ -68,12 +68,14 @@ pub fn capture_target(
         c"xdg-desktop-portal-shiny-screenshot",
         rustix::fs::MemfdFlags::CLOEXEC,
     )?;
+
     rustix::fs::ftruncate(&fd, format.byte_size())?;
 
     let buffer = capture.create_shm_buffer(target, Some(format.format), fd.as_fd())?;
     let actual_format = buffer
         .shm_format()
         .ok_or_else(|| anyhow::anyhow!("screenshot capture created a non-SHM buffer"))?;
+
     if actual_format.byte_size() > format.byte_size() {
         anyhow::bail!("screenshot buffer constraints changed during allocation");
     }
@@ -99,6 +101,7 @@ pub fn capture_region(
         .find(|output| output.name == region.monitor)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("selected monitor {} was not found", region.monitor))?;
+
     if output.size.width == 0 || output.size.height == 0 {
         anyhow::bail!("selected monitor has invalid logical dimensions");
     }
@@ -108,6 +111,7 @@ pub fn capture_region(
         &CaptureTarget::Output(output.output),
         paint_cursors,
     )?;
+
     let x = region.x as i64 * image.width as i64 / output.size.width as i64;
     let y = region.y as i64 * image.height as i64 / output.size.height as i64;
     let width = region.width as i64 * image.width as i64 / output.size.width as i64;
@@ -118,11 +122,13 @@ pub fn capture_region(
 pub fn write_png(image: &RgbaImage) -> anyhow::Result<String> {
     let directory = screenshot_directory();
     std::fs::create_dir_all(&directory)?;
+
     let sequence = SCREENSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = directory.join(format!(
         "shiny-screenshot-{}-{sequence}.png",
         std::process::id()
     ));
+
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -176,6 +182,7 @@ fn shm_to_rgba(bytes: &[u8], format: ShmFormat) -> anyhow::Result<RgbaImage> {
             image.pixels[target_offset..target_offset + 4].copy_from_slice(&rgba);
         }
     }
+
     Ok(image)
 }
 

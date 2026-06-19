@@ -7,8 +7,7 @@ use drm::node::DrmNode;
 use gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice, Modifier};
 use tracing::{debug, info, warn};
 use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
-    delegate_noop,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
     globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer::WlBuffer,
@@ -30,9 +29,7 @@ use wayland_protocols::{
             ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
         },
         image_copy_capture::v1::client::{
-            ext_image_copy_capture_frame_v1::{
-                self, ExtImageCopyCaptureFrameV1, FailureReason,
-            },
+            ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1, FailureReason},
             ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
             ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
         },
@@ -47,7 +44,6 @@ use wayland_protocols::{
     },
 };
 
-pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -257,6 +253,7 @@ impl DamageSet {
             .map(DamageRect::area)
             .sum::<u64>()
             .min(frame_area);
+
         if damaged_area * 100 >= frame_area * FULL_DAMAGE_AREA_PERCENT {
             self.full = true;
             self.rects.clear();
@@ -330,9 +327,10 @@ impl DirectCapture {
         let mut event_queue = self.conn.new_event_queue::<DiscoveryState>();
         let qh = event_queue.handle();
 
-        let xdg_output_manager =
-            self.globals
-                .bind::<ZxdgOutputManagerV1, _, _>(&qh, 3..=3, ())?;
+        let xdg_output_manager = self
+            .globals
+            .bind::<ZxdgOutputManagerV1, _, _>(&qh, 3..=3, ())?;
+
         self.conn.display().get_registry(&qh, ());
         event_queue.roundtrip(&mut state)?;
 
@@ -342,6 +340,7 @@ impl DirectCapture {
             .enumerate()
             .map(|(index, output)| xdg_output_manager.get_xdg_output(&output.output, &qh, index))
             .collect();
+
         event_queue.roundtrip(&mut state)?;
 
         for xdg_output in xdg_outputs {
@@ -356,6 +355,7 @@ impl DirectCapture {
                 output.name, output.description, output.size.width, output.size.height
             );
         }
+
         Ok(())
     }
 
@@ -367,10 +367,12 @@ impl DirectCapture {
         let _list = self
             .globals
             .bind::<ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ())?;
+
         event_queue.roundtrip(&mut state)?;
 
         self.toplevels = state.toplevels;
         info!("discovered {} Wayland toplevels", self.toplevels.len());
+
         Ok(())
     }
 
@@ -415,7 +417,12 @@ impl DirectCapture {
         };
 
         let modifier = preferred_modifier
-            .or_else(|| preferred_probe_modifier(&probe.dmabuf_formats))
+            .or_else(|| {
+                probe
+                    .dmabuf_formats
+                    .iter()
+                    .find_map(|format| format.modifiers.first().copied())
+            })
             .ok_or_else(|| anyhow::anyhow!("no DMA-BUF modifiers were advertised"))?;
 
         let mut candidates = Vec::new();
@@ -430,9 +437,9 @@ impl DirectCapture {
                     .cloned(),
             );
         } else {
-            for format in preferred_dmabuf_formats(&probe.dmabuf_formats) {
-                if format.modifiers.contains(&modifier) && !candidates.contains(&format) {
-                    candidates.push(format);
+            for format in &probe.dmabuf_formats {
+                if format.modifiers.contains(&modifier) && !candidates.contains(format) {
+                    candidates.push(format.clone());
                 }
             }
         }
@@ -445,10 +452,7 @@ impl DirectCapture {
                     warn!(
                         "failed to create DMA-BUF buffer for fourcc=0x{:08x}, \
                          size={}x{}, modifier=0x{:016x}: {err}",
-                        format.fourcc,
-                        format.size.width,
-                        format.size.height,
-                        modifier
+                        format.fourcc, format.size.width, format.size.height, modifier
                     );
                     last_error = Some(err);
                 }
@@ -503,6 +507,7 @@ impl DirectCapture {
         let frame = &capture_frame.frame;
 
         frame.attach_buffer(buffer.wl_buffer());
+
         let damage_rects = damage.rects_for_frame(buffer.size());
         if damage_rects.is_empty() {
             debug!("capturing frame with no pending client damage");
@@ -513,11 +518,16 @@ impl DirectCapture {
                 buffer.size().height
             );
         } else {
-            debug!("capturing frame with {} client damage rects", damage_rects.len());
+            debug!(
+                "capturing frame with {} client damage rects",
+                damage_rects.len()
+            );
         }
+
         for rect in damage_rects {
             frame.damage_buffer(rect.x, rect.y, rect.width, rect.height);
         }
+
         frame.capture();
 
         loop {
@@ -532,10 +542,12 @@ impl DirectCapture {
                     }
                     FrameState::Failed(_) => Err(CaptureError::Failed),
                 };
+
                 capture_frame.destroy();
                 self.conn
                     .flush()
                     .map_err(|err| CaptureError::Anyhow(err.into()))?;
+
                 return result;
             }
 
@@ -552,11 +564,7 @@ impl DirectCapture {
         target: &CaptureTarget,
         paint_cursors: bool,
         find_gbm: bool,
-    ) -> anyhow::Result<(
-        CaptureState,
-        EventQueue<CaptureState>,
-        CaptureFrame,
-    )> {
+    ) -> anyhow::Result<(CaptureState, EventQueue<CaptureState>, CaptureFrame)> {
         let mut state = CaptureState::new(find_gbm);
         let mut event_queue = self.conn.new_event_queue::<CaptureState>();
         let qh = event_queue.handle();
@@ -564,6 +572,7 @@ impl DirectCapture {
         let manager = self
             .globals
             .bind::<ExtImageCopyCaptureManagerV1, _, _>(&qh, 1..=1, ())?;
+
         let source = match target {
             CaptureTarget::Output(output) => {
                 let source_manager = self
@@ -576,11 +585,7 @@ impl DirectCapture {
             CaptureTarget::Toplevel(toplevel) => {
                 let source_manager = self
                     .globals
-                    .bind::<ExtForeignToplevelImageCaptureSourceManagerV1, _, _>(
-                        &qh,
-                        1..=1,
-                        (),
-                    )?;
+                    .bind::<ExtForeignToplevelImageCaptureSourceManagerV1, _, _>(&qh, 1..=1, ())?;
                 let source = source_manager.create_source(toplevel, &qh, ());
                 source_manager.destroy();
                 source
@@ -592,9 +597,11 @@ impl DirectCapture {
         } else {
             Options::empty()
         };
+
         let session = manager.create_session(&source, options, &qh, ());
         source.destroy();
         manager.destroy();
+
         let frame = session.create_frame(&qh, ());
 
         while !state.session_done {
@@ -606,11 +613,7 @@ impl DirectCapture {
             }
         }
 
-        Ok((
-            state,
-            event_queue,
-            CaptureFrame { frame, session },
-        ))
+        Ok((state, event_queue, CaptureFrame { frame, session }))
     }
 
     fn create_dmabuf_buffer_for_format(
@@ -622,9 +625,11 @@ impl DirectCapture {
         let mut state = CaptureState::new(false);
         let mut event_queue = self.conn.new_event_queue::<CaptureState>();
         let qh = event_queue.handle();
-        let linux_dmabuf = self
-            .globals
-            .bind::<ZwpLinuxDmabufV1, _, _>(&qh, 4..=ZwpLinuxDmabufV1::interface().version, ())?;
+        let linux_dmabuf = self.globals.bind::<ZwpLinuxDmabufV1, _, _>(
+            &qh,
+            4..=ZwpLinuxDmabufV1::interface().version,
+            (),
+        )?;
 
         let gbm_format = gbm::Format::try_from(format.fourcc)?;
         let bo = if modifier == DRM_FORMAT_MOD_INVALID {
@@ -650,6 +655,7 @@ impl DirectCapture {
                 "GBM returned modifier 0x{actual_modifier:016x}, expected 0x{modifier:016x}"
             );
         }
+
         let actual_fourcc = bo.format() as u32;
         if actual_fourcc != format.fourcc {
             anyhow::bail!(
@@ -701,15 +707,12 @@ impl DirectCapture {
 
             event_queue.blocking_dispatch(&mut state)?;
         };
+
         drop(plane_fds);
 
         info!(
             "created direct DMA-BUF wl_buffer: fourcc=0x{:08x}, size={}x{}, planes={}, modifier=0x{:016x}",
-            format.fourcc,
-            format.size.width,
-            format.size.height,
-            plane_count,
-            modifier
+            format.fourcc, format.size.width, format.size.height, plane_count, modifier
         );
 
         Ok(DirectCaptureBuffer::Dmabuf {
@@ -891,9 +894,7 @@ impl Dispatch<ZxdgOutputV1, usize> for DiscoveryState {
                 };
             }
             zxdg_output_v1::Event::Name { name } if info.name.is_empty() => info.name = name,
-            zxdg_output_v1::Event::Description { description }
-                if info.description.is_empty() =>
-            {
+            zxdg_output_v1::Event::Description { description } if info.description.is_empty() => {
                 info.description = description
             }
             _ => {}
@@ -956,10 +957,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
         match event {
             ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
                 state.session_size = Size { width, height };
+
                 for format in &mut state.shm_formats {
                     format.size = state.session_size;
                     format.stride = width * 4;
                 }
+
                 for format in &mut state.dmabuf_formats {
                     format.size = state.session_size;
                 }
@@ -982,15 +985,18 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
                     warn!("compositor sent malformed DMA-BUF device identifier");
                     return;
                 };
+
                 let dev_id = u64::from_le_bytes(bytes);
                 let Ok(node) = DrmNode::from_dev_id(dev_id) else {
                     warn!("failed to resolve DRM node for dev id {dev_id}");
                     return;
                 };
+
                 let Some(path) = node.dev_path() else {
                     warn!("DRM node for dev id {dev_id} has no path");
                     return;
                 };
+
                 match Card::open(&path).and_then(|card| {
                     GbmDevice::new(card).map_err(|err| std::io::Error::other(err.to_string()))
                 }) {
@@ -1021,9 +1027,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
             ext_image_copy_capture_session_v1::Event::Done => state.session_done = true,
             ext_image_copy_capture_session_v1::Event::Stopped => {
                 state.session_done = true;
-                state.frame_state = Some(FrameState::Failed(WEnum::Value(
-                    FailureReason::Stopped,
-                )));
+                state.frame_state = Some(FrameState::Failed(WEnum::Value(FailureReason::Stopped)));
             }
             _ => {}
         }
@@ -1182,49 +1186,6 @@ impl Card {
     }
 }
 
-fn preferred_dmabuf_formats(formats: &[DmabufFormat]) -> Vec<DmabufFormat> {
-    const PREFERRED: &[u32] = &[
-        fourcc("XR24"),
-        fourcc("AR24"),
-        fourcc("XB24"),
-        fourcc("AB24"),
-        fourcc("XR30"),
-        fourcc("AR30"),
-        fourcc("XB30"),
-        fourcc("AB30"),
-    ];
-
-    let mut result = Vec::new();
-    for fourcc in PREFERRED {
-        for format in formats.iter().filter(|format| format.fourcc == *fourcc) {
-            if !result.contains(format) {
-                result.push(format.clone());
-            }
-        }
-    }
-    for format in formats {
-        if !result.contains(format) {
-            result.push(format.clone());
-        }
-    }
-    result
-}
-
-fn preferred_probe_modifier(formats: &[DmabufFormat]) -> Option<u64> {
-    for modifier in [DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID] {
-        if formats
-            .iter()
-            .any(|format| format.modifiers.contains(&modifier))
-        {
-            return Some(modifier);
-        }
-    }
-
-    formats
-        .iter()
-        .find_map(|format| format.modifiers.first().copied())
-}
-
 fn choose_shm_format(
     formats: &[ShmFormat],
     preferred_format: Option<wl_shm::Format>,
@@ -1251,7 +1212,12 @@ fn choose_shm_format(
 
     preferred
         .into_iter()
-        .find_map(|candidate| formats.iter().find(|format| format.format == candidate).copied())
+        .find_map(|candidate| {
+            formats
+                .iter()
+                .find(|format| format.format == candidate)
+                .copied()
+        })
         .or_else(|| formats.first().copied())
 }
 

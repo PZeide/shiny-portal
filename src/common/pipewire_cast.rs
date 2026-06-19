@@ -28,8 +28,8 @@ use wayland_client::protocol::wl_shm;
 
 use crate::{
     common::wayland_capture::{
-        CaptureError, CaptureProbe, CaptureTarget, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR,
-        DamageRect, DamageSet, DirectCapture, DirectCaptureBuffer, DmabufFormat, Size, fourcc,
+        CaptureError, CaptureProbe, CaptureTarget, DamageRect, DamageSet, DirectCapture,
+        DirectCaptureBuffer, Size, fourcc,
     },
     config::Config,
 };
@@ -127,20 +127,17 @@ impl StreamFormatState {
         let mut spa_formats = Vec::new();
         let mut modifiers = Vec::new();
         if dmabuf_available {
-            for format in preferred_dmabuf_formats(&probe.dmabuf_formats) {
-                let preferred = preferred_modifiers(&format.modifiers);
-                if preferred.is_empty() {
+            for format in &probe.dmabuf_formats {
+                let Some(spa_format) = drm_fourcc_to_spa(format.fourcc) else {
                     continue;
-                }
+                };
 
-                if let Some(spa_format) = drm_fourcc_to_spa(format.fourcc)
-                    && !spa_formats.contains(&spa_format)
-                {
+                if !spa_formats.contains(&spa_format) {
                     spa_formats.push(spa_format);
                 }
-                for modifier in preferred {
-                    if !modifiers.contains(&modifier) {
-                        modifiers.push(modifier);
+                for modifier in &format.modifiers {
+                    if !modifiers.contains(modifier) {
+                        modifiers.push(*modifier);
                     }
                 }
             }
@@ -223,6 +220,7 @@ impl StreamingData {
                             Ok(formats) => {
                                 self.formats = formats;
                                 self.reset_buffer_damage();
+
                                 let format = format_param(
                                     self.formats.size.width,
                                     self.formats.size.height,
@@ -230,12 +228,14 @@ impl StreamingData {
                                     &self.formats.modifiers,
                                     self.max_fps,
                                 );
+
                                 let buffers = buffer_param(
                                     self.formats.size.width,
                                     self.formats.size.height,
                                     self.formats.dmabuf_supported,
                                     self.allow_shm_fallback,
                                 );
+
                                 let params = &mut [
                                     Pod::from_bytes(&format).expect("format pod must be valid"),
                                     Pod::from_bytes(&buffers).expect("buffer pod must be valid"),
@@ -272,6 +272,7 @@ impl StreamingData {
             let selected_modifier = self
                 .chosen_modifier
                 .or_else(|| self.formats.modifiers.first().copied());
+
             let capture_buffer = match self.capture.create_dmabuf_buffer(
                 &self.target,
                 selected_fourcc,
@@ -288,10 +289,12 @@ impl StreamingData {
                 error!("DMA-BUF capture allocation returned a non-DMA-BUF buffer");
                 return;
             };
+
             let Some(format) = capture_buffer.dmabuf_format() else {
                 error!("DMA-BUF capture buffer did not expose a format");
                 return;
             };
+
             let Some(modifier) = capture_buffer.modifier() else {
                 error!("DMA-BUF capture buffer did not expose a modifier");
                 return;
@@ -311,6 +314,7 @@ impl StreamingData {
                         return;
                     }
                 };
+
                 let offset = bo.offset(index as i32);
                 let stride = bo.stride_for_plane(index as i32);
 
@@ -349,6 +353,7 @@ impl StreamingData {
             error!("expected one SHM PipeWire data block, got {}", datas.len());
             return;
         }
+
         let data = &mut datas[0];
         let size = self.formats.size;
         let name = c"xdg-desktop-portal-shiny";
@@ -359,10 +364,12 @@ impl StreamingData {
                 return;
             }
         };
+
         if let Err(err) = rustix::fs::ftruncate(&fd, (size.width * size.height * 4) as _) {
             error!("failed to resize memfd for SHM fallback: {err}");
             return;
         }
+
         let preferred_shm_format = self.chosen_format.and_then(spa_to_shm_format);
         let capture_buffer =
             match self
@@ -402,6 +409,7 @@ impl StreamingData {
                 pending_damage: DamageSet::full(),
             })) as *mut c_void;
         }
+
         if !self.buffers.contains(&buffer) {
             self.buffers.push(buffer);
         }
@@ -473,6 +481,7 @@ impl StreamingData {
             let stream_buffer = unsafe { &mut *(user_data as *mut StreamBuffer) };
             stream_buffer.pending_damage = DamageSet::full();
         }
+
         debug!(
             "reset pending damage to full for {} PipeWire buffers",
             self.buffers.len()
@@ -535,6 +544,7 @@ impl StreamReadyState {
         if let Some(serial) = serial {
             self.serials.insert(node_id, serial);
         }
+
         self.send_if_ready();
     }
 
@@ -547,9 +557,11 @@ impl StreamReadyState {
         let Some(node_id) = self.node_id else {
             return;
         };
+
         let Some(serial) = self.serials.get(&node_id).copied() else {
             return;
         };
+
         let Some(sender) = self.sender.take() else {
             return;
         };
@@ -590,7 +602,21 @@ fn start_stream(
     }
 
     let probe = capture.probe(&target, overlay_cursor)?;
-    log_probe(&probe);
+
+    for format in &probe.dmabuf_formats {
+        debug!(
+            "wayland DMA-BUF format: fourcc=0x{:08x}, modifiers={:?}, size={}x{}",
+            format.fourcc, format.modifiers, format.size.width, format.size.height
+        );
+    }
+
+    for format in &probe.shm_formats {
+        debug!(
+            "wayland SHM format: {:?}, size={}x{}, stride={}",
+            format.format, format.size.width, format.size.height, format.stride
+        );
+    }
+
     let formats = StreamFormatState::from_probe(probe, allow_shm_fallback)?;
 
     info!(
@@ -679,12 +705,14 @@ fn start_stream(
         &formats.modifiers,
         config.max_fps,
     );
+
     let buffers = buffer_param(
         formats.size.width,
         formats.size.height,
         formats.dmabuf_supported,
         allow_shm_fallback,
     );
+
     let params = &mut [
         Pod::from_bytes(&format).expect("format pod must be valid"),
         Pod::from_bytes(&buffers).expect("buffer pod must be valid"),
@@ -706,21 +734,6 @@ fn start_stream(
         context,
         node_id_rx,
     ))
-}
-
-fn log_probe(probe: &CaptureProbe) {
-    for format in &probe.dmabuf_formats {
-        debug!(
-            "Wayland DMA-BUF format: fourcc=0x{:08x}, modifiers={:?}, size={}x{}",
-            format.fourcc, format.modifiers, format.size.width, format.size.height
-        );
-    }
-    for format in &probe.shm_formats {
-        debug!(
-            "Wayland SHM format: {:?}, size={}x{}, stride={}",
-            format.format, format.size.width, format.size.height, format.stride
-        );
-    }
 }
 
 fn value_to_bytes(value: pod::Value) -> Vec<u8> {
@@ -747,6 +760,7 @@ fn buffer_param(
     } else {
         vec![memfd_bit]
     };
+
     let data_type_default = *data_type_flags.first().expect("buffer data type flags");
 
     info!(
@@ -891,49 +905,6 @@ fn format_param(
     }
 
     value_to_bytes(pod::Value::Object(obj))
-}
-
-fn preferred_dmabuf_formats(formats: &[DmabufFormat]) -> Vec<DmabufFormat> {
-    const PREFERRED: &[u32] = &[
-        fourcc("XR24"),
-        fourcc("AR24"),
-        fourcc("XB24"),
-        fourcc("AB24"),
-        fourcc("XR30"),
-        fourcc("AR30"),
-        fourcc("XB30"),
-        fourcc("AB30"),
-    ];
-
-    let mut result = Vec::new();
-    for fourcc in PREFERRED {
-        for format in formats.iter().filter(|format| format.fourcc == *fourcc) {
-            if !result.contains(format) {
-                result.push(format.clone());
-            }
-        }
-    }
-    for format in formats {
-        if !result.contains(format) {
-            result.push(format.clone());
-        }
-    }
-    result
-}
-
-fn preferred_modifiers(modifiers: &[u64]) -> Vec<u64> {
-    let mut result = Vec::new();
-    for modifier in [DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID] {
-        if modifiers.contains(&modifier) {
-            result.push(modifier);
-        }
-    }
-    for modifier in modifiers {
-        if !result.contains(modifier) {
-            result.push(*modifier);
-        }
-    }
-    result
 }
 
 fn drm_fourcc_to_spa(fourcc_code: u32) -> Option<VideoFormat> {
