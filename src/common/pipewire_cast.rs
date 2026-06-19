@@ -576,6 +576,7 @@ impl StreamingData {
                         );
                         return;
                     };
+
                     match self.capture.dmabuf_plane_count(fourcc, info.modifier()) {
                         Ok(plane_count) if plane_count > 0 => plane_count,
                         Ok(_) => {
@@ -591,6 +592,7 @@ impl StreamingData {
                     self.chosen_modifier = None;
                     1
                 };
+
                 let framerate = info.framerate();
                 let max_framerate = info.max_framerate();
 
@@ -614,6 +616,7 @@ impl StreamingData {
                     plane_count,
                     uses_dmabuf,
                 );
+
                 let mut params = [Pod::from_bytes(&buffers).expect("buffer pod must be valid")];
                 if let Err(err) = stream.update_params(&mut params) {
                     error!("failed to publish selected pw buffer parameters: {err}");

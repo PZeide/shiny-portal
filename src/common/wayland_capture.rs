@@ -470,6 +470,7 @@ impl DirectCapture {
         let Some(gbm) = self.gbm.as_ref() else {
             anyhow::bail!("compositor did not provide a dma-buf device");
         };
+
         let format = gbm::Format::try_from(fourcc)?;
         gbm.format_modifier_plane_count(format, Modifier::from(modifier))
             .ok_or_else(|| {
