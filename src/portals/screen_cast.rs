@@ -183,7 +183,7 @@ impl ScreenCastPortal {
                 let thread = inner.cast_thread.take();
 
                 async move {
-                    debug!("removing screencast session {session_handle:?}");
+                    info!("removing screencast session {session_handle:?}");
                     if let Some(thread) = thread {
                         debug!("stopping active pw stream for {session_handle:?}");
                         thread.stop();
