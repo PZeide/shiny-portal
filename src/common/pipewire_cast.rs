@@ -697,10 +697,11 @@ fn start_stream(
         },
     )?;
 
-    let allow_shm_fallback = config.allow_shm;
+    let allow_shm_fallback = config.allow_screencast_shm;
     if allow_shm_fallback {
         warn!("shm fallback is enabled by configuration");
     }
+
     if config.max_fps == 0 {
         info!("screencast capture rate is unlimited");
     } else {
@@ -748,6 +749,7 @@ fn start_stream(
             if global.type_ != ObjectType::Node {
                 return;
             }
+
             let Some(serial) = global
                 .props
                 .as_ref()
@@ -1023,6 +1025,7 @@ fn fixed_format_param(
         flags: pod::PropertyFlags::empty(),
         value: pod::Value::Id(spa::utils::Id(video_format.as_raw())),
     });
+
     obj.properties.push(pod::Property {
         key: FormatProperties::VideoModifier.as_raw(),
         flags: pod::PropertyFlags::MANDATORY,

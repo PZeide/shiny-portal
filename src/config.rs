@@ -8,15 +8,15 @@ use serde::Deserialize;
 const DEFAULT_CONFIG: &str = r#"# Maximum screencast capture rate. 0 disables the limit.
 max_fps = 0
 
-# Allow PipeWire to fall back to shared-memory buffers when DMA-BUF is unavailable.
-allow_shm = false
+# Allow PipeWire to fall back to shared-memory buffers when DMA-BUF is unavailable when screencasting.
+allow_screencast_shm = false
 "#;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub max_fps: u32,
-    pub allow_shm: bool,
+    pub allow_screencast_shm: bool,
 }
 
 impl Config {

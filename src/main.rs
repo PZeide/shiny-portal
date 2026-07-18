@@ -26,19 +26,13 @@ async fn main() {
 
     fmt().with_env_filter(filter).init();
 
-    let (config, config_path) = match Config::load_or_create() {
+    let (config, _) = match Config::load_or_create() {
         Ok(config) => config,
         Err(err) => {
             error!("failed to load configuration: {err}");
             return;
         }
     };
-    info!(
-        "loaded configuration from {}: max_fps={}, allow_shm={}",
-        config_path.display(),
-        config.max_fps,
-        config.allow_shm
-    );
 
     let portal_connection = match start_portal(config).await {
         Ok(conn) => conn,

@@ -6,7 +6,7 @@ use zvariant::{DeserializeDict, ObjectPath, SerializeDict, Type};
 
 use crate::{
     common::{
-        screenshot_capture::{capture_region, write_png},
+        screenshot_capture::{capture_region, write_image},
         shell_ipc::{RegionSelectorOptions, RegionSelectorResult, ShinyShell},
         wayland_capture::DirectCapture,
     },
@@ -104,7 +104,7 @@ impl ScreenshotPortal {
             }
         };
 
-        let uri = match write_png(&image) {
+        let uri = match write_image(&image) {
             Ok(uri) => uri,
             Err(err) => {
                 warn!("failed to write screenshot image: {err}");

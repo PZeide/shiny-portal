@@ -119,14 +119,16 @@ pub fn capture_region(
     image.crop(x, y, width, height)
 }
 
-pub fn write_png(image: &RgbaImage) -> anyhow::Result<String> {
+pub fn write_image(image: &RgbaImage) -> anyhow::Result<String> {
     let directory = screenshot_directory();
     std::fs::create_dir_all(&directory)?;
 
     let sequence = SCREENSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let now = chrono::Local::now();
+
     let path = directory.join(format!(
-        "shiny-screenshot-{}-{sequence}.png",
-        std::process::id()
+        "screenshot-{}-{sequence}.png",
+        now.format("%Y-%m-%d_%H-%M-%S")
     ));
 
     let file = OpenOptions::new()
@@ -247,10 +249,7 @@ fn image_byte_len(width: u32, height: u32) -> anyhow::Result<usize> {
 }
 
 fn screenshot_directory() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("xdg-desktop-portal-shiny")
+    std::env::temp_dir().join("xdg-desktop-portal-shiny")
 }
 
 fn path_to_file_uri(path: &Path) -> String {
@@ -266,5 +265,6 @@ fn path_to_file_uri(path: &Path) -> String {
             }
         }
     }
+
     uri
 }
