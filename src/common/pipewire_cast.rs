@@ -871,8 +871,8 @@ fn buffer_param(width: u32, height: u32, blocks: u32, use_dmabuf: bool) -> Vec<u
             value: pod::Value::Choice(pod::ChoiceValue::Int(spa::utils::Choice(
                 spa::utils::ChoiceFlags::empty(),
                 spa::utils::ChoiceEnum::Flags {
-                    default: data_type as i32,
-                    flags: vec![data_type as i32],
+                    default: data_type,
+                    flags: vec![data_type],
                 },
             ))),
         },
@@ -1058,36 +1058,36 @@ fn fixed_format_param(
 
 fn drm_fourcc_to_spa(fourcc_code: u32) -> Option<VideoFormat> {
     match fourcc_code {
-        code if code == fourcc("AR24") => Some(VideoFormat::BGRA),
-        code if code == fourcc("XR24") => Some(VideoFormat::BGRx),
-        code if code == fourcc("RA24") => Some(VideoFormat::ABGR),
-        code if code == fourcc("RX24") => Some(VideoFormat::xBGR),
-        code if code == fourcc("AB24") => Some(VideoFormat::RGBA),
-        code if code == fourcc("XB24") => Some(VideoFormat::RGBx),
-        code if code == fourcc("BA24") => Some(VideoFormat::ARGB),
-        code if code == fourcc("BX24") => Some(VideoFormat::xRGB),
-        code if code == fourcc("XR30") => Some(VideoFormat::xRGB_210LE),
-        code if code == fourcc("XB30") => Some(VideoFormat::xBGR_210LE),
-        code if code == fourcc("AR30") => Some(VideoFormat::ARGB_210LE),
-        code if code == fourcc("AB30") => Some(VideoFormat::ABGR_210LE),
+        code if code == fourcc(b"AR24") => Some(VideoFormat::BGRA),
+        code if code == fourcc(b"XR24") => Some(VideoFormat::BGRx),
+        code if code == fourcc(b"RA24") => Some(VideoFormat::ABGR),
+        code if code == fourcc(b"RX24") => Some(VideoFormat::xBGR),
+        code if code == fourcc(b"AB24") => Some(VideoFormat::RGBA),
+        code if code == fourcc(b"XB24") => Some(VideoFormat::RGBx),
+        code if code == fourcc(b"BA24") => Some(VideoFormat::ARGB),
+        code if code == fourcc(b"BX24") => Some(VideoFormat::xRGB),
+        code if code == fourcc(b"XR30") => Some(VideoFormat::xRGB_210LE),
+        code if code == fourcc(b"XB30") => Some(VideoFormat::xBGR_210LE),
+        code if code == fourcc(b"AR30") => Some(VideoFormat::ARGB_210LE),
+        code if code == fourcc(b"AB30") => Some(VideoFormat::ABGR_210LE),
         _ => None,
     }
 }
 
 fn spa_to_drm_fourcc(format: VideoFormat) -> Option<u32> {
     match format {
-        VideoFormat::BGRA => Some(fourcc("AR24")),
-        VideoFormat::BGRx => Some(fourcc("XR24")),
-        VideoFormat::ABGR => Some(fourcc("RA24")),
-        VideoFormat::xBGR => Some(fourcc("RX24")),
-        VideoFormat::RGBA => Some(fourcc("AB24")),
-        VideoFormat::RGBx => Some(fourcc("XB24")),
-        VideoFormat::ARGB => Some(fourcc("BA24")),
-        VideoFormat::xRGB => Some(fourcc("BX24")),
-        VideoFormat::xRGB_210LE => Some(fourcc("XR30")),
-        VideoFormat::xBGR_210LE => Some(fourcc("XB30")),
-        VideoFormat::ARGB_210LE => Some(fourcc("AR30")),
-        VideoFormat::ABGR_210LE => Some(fourcc("AB30")),
+        VideoFormat::BGRA => Some(fourcc(b"AR24")),
+        VideoFormat::BGRx => Some(fourcc(b"XR24")),
+        VideoFormat::ABGR => Some(fourcc(b"RA24")),
+        VideoFormat::xBGR => Some(fourcc(b"RX24")),
+        VideoFormat::RGBA => Some(fourcc(b"AB24")),
+        VideoFormat::RGBx => Some(fourcc(b"XB24")),
+        VideoFormat::ARGB => Some(fourcc(b"BA24")),
+        VideoFormat::xRGB => Some(fourcc(b"BX24")),
+        VideoFormat::xRGB_210LE => Some(fourcc(b"XR30")),
+        VideoFormat::xBGR_210LE => Some(fourcc(b"XB30")),
+        VideoFormat::ARGB_210LE => Some(fourcc(b"AR30")),
+        VideoFormat::ABGR_210LE => Some(fourcc(b"AB30")),
         _ => None,
     }
 }

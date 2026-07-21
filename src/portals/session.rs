@@ -2,10 +2,12 @@ use futures_util::{FutureExt, future::BoxFuture};
 use zbus::{ObjectServer, interface, object_server::SignalEmitter};
 use zvariant::{ObjectPath, OwnedObjectPath};
 
+type CleanupFn<T> = Box<dyn FnOnce(&mut T) -> BoxFuture<'static, ()> + Send + Sync + 'static>;
+
 pub struct Session<T: Send + Sync + 'static> {
     handle_path: OwnedObjectPath,
     pub inner: T,
-    cleanup_fn: Option<Box<dyn FnOnce(&mut T) -> BoxFuture<'static, ()> + Send + Sync + 'static>>,
+    cleanup_fn: Option<CleanupFn<T>>,
 }
 
 impl<T: Send + Sync + 'static> Session<T> {

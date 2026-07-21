@@ -7,7 +7,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-pub static SHINY_SHELL_COMMAND: &str = "shiny-shell";
+pub const SHINY_SHELL_COMMAND: &str = "shiny-shell";
 
 #[derive(Error, Debug)]
 pub enum ShellError {
@@ -54,7 +54,7 @@ impl ShinyShell {
             .output()
             .await?;
 
-        if !output.status.success() || !output.stderr.is_empty() {
+        if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr)
                 .lines()
                 .find(|line| !line.trim().is_empty())
@@ -62,6 +62,13 @@ impl ShinyShell {
                 .to_string();
 
             return Err(ShellError::ShinyShell(error));
+        }
+
+        if !output.stderr.is_empty() {
+            debug!(
+                "shell command wrote to stderr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -113,7 +120,9 @@ impl ShinyShell {
 
                                 match serde_json::from_str::<T>(line) {
                                     Ok(data) => {
-                                        let _ = tx.send(data).await;
+                                        if tx.send(data).await.is_err() {
+                                            break;
+                                        }
                                     }
                                     Err(err) => warn!("error deserializing shell signal: {err}"),
                                 }
@@ -142,7 +151,7 @@ impl ShinyShell {
     ) -> Result<RegionSelectorResult, ShellError> {
         let json = serde_json::to_string(&options)?;
         let request_id = self
-            .call::<RegionSelectorRequestResult>("region-selector", "request", &[&json])
+            .call::<ShellRequestResult>("region-selector", "request", &[&json])
             .await?
             .0;
 
@@ -150,21 +159,11 @@ impl ShinyShell {
             .listen::<RegionSelectorResult>("region-selector", "result")
             .await?;
 
-        while let Some(result) = rx.recv().await {
-            match &result {
-                RegionSelectorResult::Selected { key, .. }
-                | RegionSelectorResult::Cancelled { key }
-                    if key == &request_id =>
-                {
-                    return Ok(result);
-                }
-                _ => {}
-            }
-        }
-
-        Err(ShellError::Ipc(
-            "stream closed without picker result".into(),
-        ))
+        receive_matching(&mut rx, &request_id, |result, request_id| match result {
+            RegionSelectorResult::Selected { key, .. }
+            | RegionSelectorResult::Cancelled { key } => key == request_id,
+        })
+        .await
     }
 
     pub async fn share_picker(
@@ -173,7 +172,7 @@ impl ShinyShell {
     ) -> Result<SharePickerResult, ShellError> {
         let json = serde_json::to_string(&options)?;
         let request_id = self
-            .call::<SharePickerRequestResult>("share-picker", "request", &[&json])
+            .call::<ShellRequestResult>("share-picker", "request", &[&json])
             .await?
             .0;
 
@@ -181,21 +180,32 @@ impl ShinyShell {
             .listen::<SharePickerResult>("share-picker", "result")
             .await?;
 
-        while let Some(result) = rx.recv().await {
-            match &result {
-                SharePickerResult::Selected { key, .. } | SharePickerResult::Cancelled { key }
-                    if key == &request_id =>
-                {
-                    return Ok(result);
-                }
-                _ => {}
+        receive_matching(&mut rx, &request_id, |result, request_id| match result {
+            SharePickerResult::Selected { key, .. } | SharePickerResult::Cancelled { key } => {
+                key == request_id
             }
-        }
-
-        Err(ShellError::Ipc(
-            "stream closed without picker result".into(),
-        ))
+        })
+        .await
     }
+}
+
+async fn receive_matching<T, F>(
+    receiver: &mut mpsc::Receiver<T>,
+    request_id: &str,
+    matches_request: F,
+) -> Result<T, ShellError>
+where
+    F: Fn(&T, &str) -> bool,
+{
+    while let Some(result) = receiver.recv().await {
+        if matches_request(&result, request_id) {
+            return Ok(result);
+        }
+    }
+
+    Err(ShellError::Ipc(
+        "stream closed without a matching result".into(),
+    ))
 }
 
 #[derive(Deserialize, Debug)]
@@ -210,10 +220,7 @@ pub struct CustomRegion {
 }
 
 #[derive(Deserialize, Debug)]
-struct RegionSelectorRequestResult(String);
-
-#[derive(Deserialize, Debug)]
-struct SharePickerRequestResult(String);
+struct ShellRequestResult(String);
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "status", rename_all = "camelCase")]

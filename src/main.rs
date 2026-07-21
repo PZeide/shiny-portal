@@ -26,7 +26,7 @@ async fn main() {
 
     fmt().with_env_filter(filter).init();
 
-    let (config, _) = match Config::load_or_create() {
+    let config = match Config::load_or_create() {
         Ok(config) => config,
         Err(err) => {
             error!("failed to load configuration: {err}");

@@ -20,7 +20,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load_or_create() -> anyhow::Result<(Self, PathBuf)> {
+    pub fn load_or_create() -> anyhow::Result<Self> {
         let path = config_path()?;
         if !path.exists() {
             let parent = path
@@ -33,7 +33,7 @@ impl Config {
         let source = fs::read_to_string(&path)?;
         let config = toml::from_str(&source)
             .map_err(|err| anyhow::anyhow!("invalid configuration {}: {err}", path.display()))?;
-        Ok((config, path))
+        Ok(config)
     }
 }
 

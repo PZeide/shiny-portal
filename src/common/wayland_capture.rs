@@ -1239,8 +1239,7 @@ fn choose_shm_format(
         .or_else(|| formats.first().copied())
 }
 
-pub const fn fourcc(code: &str) -> u32 {
-    let bytes = code.as_bytes();
+pub const fn fourcc(bytes: &[u8; 4]) -> u32 {
     (bytes[0] as u32)
         | ((bytes[1] as u32) << 8)
         | ((bytes[2] as u32) << 16)

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use enumflags2::bitflags;
 use serde_repr::{Deserialize_repr as DeserializeRepr, Serialize_repr as SerializeRepr};
 use tracing::{debug, info, warn};
@@ -79,35 +80,11 @@ impl ScreenshotPortal {
             );
         }
 
-        let region = match self.select_area().await {
-            Ok(Some(region)) => region,
+        let uri = match self.capture_area().await {
+            Ok(Some(uri)) => uri,
             Ok(None) => return Ok(PortalResponse::Cancelled),
             Err(err) => {
-                warn!("screenshot area selection failed: {err}");
-                return Ok(PortalResponse::Other);
-            }
-        };
-
-        let mut capture = match DirectCapture::connect() {
-            Ok(capture) => capture,
-            Err(err) => {
-                warn!("failed to create screenshot wayland connection: {err}");
-                return Ok(PortalResponse::Other);
-            }
-        };
-
-        let image = match capture_region(&mut capture, &region, false) {
-            Ok(image) => image,
-            Err(err) => {
-                warn!("screenshot capture failed: {err}");
-                return Ok(PortalResponse::Other);
-            }
-        };
-
-        let uri = match write_image(&image) {
-            Ok(uri) => uri,
-            Err(err) => {
-                warn!("failed to write screenshot image: {err}");
+                warn!("screenshot failed: {err:#}");
                 return Ok(PortalResponse::Other);
             }
         };
@@ -118,6 +95,18 @@ impl ScreenshotPortal {
 }
 
 impl ScreenshotPortal {
+    async fn capture_area(&self) -> anyhow::Result<Option<String>> {
+        let Some(region) = self.select_area().await.context("area selection failed")? else {
+            return Ok(None);
+        };
+
+        let mut capture = DirectCapture::connect().context("Wayland connection failed")?;
+        let image = capture_region(&mut capture, &region, false).context("capture failed")?;
+        let uri = write_image(&image).context("writing the image failed")?;
+
+        Ok(Some(uri))
+    }
+
     async fn select_area(&self) -> anyhow::Result<Option<crate::common::shell_ipc::CustomRegion>> {
         let result = self
             .shell

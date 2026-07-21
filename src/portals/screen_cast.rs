@@ -275,9 +275,12 @@ impl ScreenCastPortal {
         let persist_mode = options.persist_mode;
         let overlay_cursor = options.cursor_mode == CursorMode::Embedded;
 
-        let Ok(capture) = DirectCapture::connect() else {
-            warn!("failed to create wayland capture connection");
-            return Ok(PortalResponse::Other);
+        let capture = match DirectCapture::connect() {
+            Ok(capture) => capture,
+            Err(err) => {
+                warn!("failed to create wayland capture connection: {err}");
+                return Ok(PortalResponse::Other);
+            }
         };
 
         let restored_source = options
